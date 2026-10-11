@@ -8293,6 +8293,85 @@ def _release_fingerprint(files: list[Path]) -> str:
     return digest.hexdigest()
 
 
+RELEASE_WHEEL_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
+_MANYLINUX_X86_64 = ("manylinux_2_17_x86_64", "manylinux2014_x86_64", "manylinux_2_28_x86_64",
+                     "manylinux_2_34_x86_64")
+
+
+def _lock_blocks(lock: Path) -> list[tuple[str, str, str]]:
+
+    entries: list[tuple[str, str, str]] = []
+    current: list[str] = []
+
+    def _close() -> None:
+        if not current:
+            return
+        head, _, marker = current[0].rstrip(" \\").partition(";")
+        name = re.sub(r"[-_.]+", "-", head.split("==")[0].strip()).lower()
+        block = "\n".join([head.strip() + " \\", *current[1:]]).rstrip(" \\")
+        entries.append((name, marker.strip(), block))
+
+    for line in lock.read_text().splitlines():
+        if line and not line[0].isspace() and not line.startswith("#"):
+            _close()
+            current = [line]
+        elif current and line.strip().startswith("--hash"):
+            current.append(line)
+    _close()
+    return entries
+
+
+def _marker_applies(marker: str, python_version: str) -> bool:
+
+    if not marker:
+        return True
+    try:
+        from packaging.markers import Marker
+    except ImportError:
+        from pip._vendor.packaging.markers import Marker
+    env = {"python_version": python_version, "python_full_version": python_version + ".0",
+           "implementation_name": "cpython", "platform_python_implementation": "CPython",
+           "sys_platform": "linux", "platform_system": "Linux", "platform_machine": "x86_64",
+           "os_name": "posix"}
+    return bool(Marker(marker).evaluate(env))
+
+
+def _download_wheels_for_other_pythons(lock: Path, wheel_dir: Path) -> list[str]:
+
+    entries = _lock_blocks(lock)
+    here = f"{sys.version_info.major}.{sys.version_info.minor}"
+    missed: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        def _pip(blocks: list[str], extra: list[str]) -> bool:
+            req_file = Path(tmp) / "req.txt"
+            req_file.write_text("\n".join(blocks) + "\n")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "download", "--quiet", "--require-hashes",
+                 "--no-deps", "-r", str(req_file), "-d", str(wheel_dir), *extra],
+                capture_output=True, text=True, timeout=1800, check=False)
+            return result.returncode == 0
+
+        binary = ["--only-binary=:all:", "--implementation", "cp"]
+        for platform in _MANYLINUX_X86_64:
+            binary += ["--platform", platform]
+        for version in RELEASE_WHEEL_PYTHONS:
+            if version == here:
+                continue
+            blocks = [block for _, marker, block in entries if _marker_applies(marker, version)]
+            if not blocks or _pip(blocks, [*binary, "--python-version", version]):
+                continue
+
+
+            ok = True
+            for block in blocks:
+                if not (_pip([block], [*binary, "--python-version", version])
+                        or _pip([block], ["--no-binary=:all:"])):
+                    ok = False
+            if not ok:
+                missed.append(version)
+    return missed
+
+
 def build_release_archive(dest: Path, *, with_wheels: bool = True) -> dict:
 
     import tarfile
@@ -8309,6 +8388,17 @@ def build_release_archive(dest: Path, *, with_wheels: bool = True) -> dict:
             if result.returncode != 0:
                 raise engine.ConfigError(f"couldn't download the dependency wheels: "
                                          f"{result.stderr.strip()[-400:]}")
+            _download_wheels_for_other_pythons(lock, wheel_dir)
+            if any(not w.name.endswith(".whl") for w in wheel_dir.iterdir()):
+
+
+                tools = subprocess.run(
+                    [sys.executable, "-m", "pip", "download", "--quiet", "--only-binary=:all:",
+                     "setuptools", "wheel", "-d", str(wheel_dir)],
+                    capture_output=True, text=True, timeout=600, check=False)
+                if tools.returncode != 0:
+                    raise engine.ConfigError(f"couldn't download the build tools for the release "
+                                             f"copy: {tools.stderr.strip()[-400:]}")
             wheels = sorted(wheel_dir.iterdir())
         with tarfile.open(dest, "w:gz") as tar:
             for path in files:

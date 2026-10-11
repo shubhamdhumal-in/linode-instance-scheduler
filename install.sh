@@ -317,7 +317,9 @@ configure_env() {
   umask 077
   ENV_STAGE=$(mktemp "$INSTALL_DIR/.env.new.XXXXXX")
   trap 'cleanup_env_stage; exit 130' INT TERM
-  if [[ -n "$ENV_FILE_IN" ]]; then
+  # With --env-from-backup, --env-file only carried the bucket settings, already used to restore
+  # the full .env above -- so build on the restored file, not on that partial one.
+  if [[ -n "$ENV_FILE_IN" && $ENV_FROM_BACKUP -eq 0 ]]; then
     [[ -f "$ENV_FILE_IN" ]] || die "no file at $ENV_FILE_IN"
     log "Using credentials from $ENV_FILE_IN"
     cat "$ENV_FILE_IN" > "$ENV_STAGE"
@@ -497,7 +499,9 @@ restore_env_backup() {  # recover --env-from-backup: every setting and the key f
   stage_set LINODE_SSH_KEY_PATH "$KEY_PATH"
   chown "$SERVICE_USER:$SERVICE_USER" "$ENV_STAGE"; chmod 600 "$ENV_STAGE"
   mv -f "$ENV_STAGE" "$file"; ENV_STAGE=""; trap - INT TERM
-  ident=$(mktemp); chown "$SERVICE_USER" "$ident"; chmod 600 "$ident"
+  # Written first, handed to the service user after: with fs.protected_regular (on by default on
+  # Ubuntu), even root can't open a /tmp file another user owns for writing.
+  ident=$(mktemp); chmod 600 "$ident"
   if [[ -n "$AGE_IDENTITY" ]]; then
     [[ -r "$AGE_IDENTITY" ]] || { rm -f "$ident"; die "can't read $AGE_IDENTITY"; }
     cat "$AGE_IDENTITY" > "$ident"
@@ -506,6 +510,7 @@ restore_env_backup() {  # recover --env-from-backup: every setting and the key f
     read -r -s -p "Your age identity (the AGE-SECRET-KEY-... line): " v </dev/tty; printf '\n' >/dev/tty
     printf '%s\n' "$v" > "$ident"; v=""
   fi
+  chown "$SERVICE_USER" "$ident"
   log "Restoring every setting and the deployment SSH key from the encrypted backup"
   if im env-restore --identity-file "$ident" --ssh-key "$KEY_PATH" --force; then
     rm -f "$ident"
