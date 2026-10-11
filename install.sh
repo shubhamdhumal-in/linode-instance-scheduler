@@ -19,6 +19,9 @@ SSH_KEY_IN=""
 SSH_KEY_FROM_BACKUP=0
 NEW_SSH_KEY=0
 NEW_PASSPHRASE=""
+ENV_BACKUP_RECIPIENT=""
+ENV_FROM_BACKUP=0
+AGE_IDENTITY=""
 KEY_FROM_SNAPSHOT=0
 PASSPHRASE_FILE=""
 WITH_API=1
@@ -73,6 +76,13 @@ Options:
                             gone -- managed instances won't trust it until you add it to each one
   --backup-ssh-key          (kept for older scripts -- the key is now always stored encrypted, in the
                             database, Object Storage and your Linode profile's SSH keys)
+  --env-backup-recipient KEY
+                            install: your age public key (age1...). An encrypted copy of .env and
+                            the SSH key is kept in Object Storage that only your age identity opens
+                            (asked interactively if not given)
+  --env-from-backup         recover: take every setting and the SSH key from that encrypted copy --
+                            asks only for the bucket settings and your age identity
+  --age-identity PATH       recover: file with your AGE-SECRET-KEY line (else asked for)
   --passphrase-file PATH    Read that passphrase from a file instead of prompting
   --no-api                  Don't install the REST API / dashboard service
   --api-port PORT           API port on 127.0.0.1 (default 8000)
@@ -106,6 +116,9 @@ while [[ $# -gt 0 ]]; do
     --new-ssh-key) NEW_SSH_KEY=1; shift ;;
     --backup-ssh-key) shift ;;  # the key is always stored now; kept for older scripts
     --passphrase-file) PASSPHRASE_FILE="$2"; shift 2 ;;
+    --env-backup-recipient) ENV_BACKUP_RECIPIENT="$2"; shift 2 ;;
+    --env-from-backup) ENV_FROM_BACKUP=1; shift ;;
+    --age-identity) AGE_IDENTITY="$2"; shift 2 ;;
     --no-api) WITH_API=0; shift ;;
     --api-port) API_PORT="$2"; shift 2 ;;
     --domain) DOMAIN="$2"; shift 2 ;;
@@ -308,6 +321,17 @@ configure_env() {
     warn "LINODE_OAUTH_REDIRECT_URI doesn't match https://$DOMAIN/oauth/callback -- login only works when the OAuth app's callback URL, .env and the domain all agree."
   fi
   stage_set LINODE_SSH_KEY_PATH "$KEY_PATH"
+  if [[ -n "$ENV_BACKUP_RECIPIENT" ]]; then
+    stage_set LIS_ENV_BACKUP_RECIPIENTS "$ENV_BACKUP_RECIPIENT"
+  elif [[ $ASSUME_YES -eq 0 ]] && ! stage_has LIS_ENV_BACKUP_RECIPIENTS && stage_obj_complete; then
+    local recipient
+    while :; do
+      recipient=$(ask "Your age public key (age1...) for an encrypted copy of these settings only you can open -- make one with age-keygen on your own machine (blank to skip)" '')
+      [[ -z "$recipient" || "$recipient" =~ ^age1[0-9a-z]{50,}$ ]] && break
+      printf '  (that isn'"'"'t an age public key -- it starts with age1)\n' >/dev/tty
+    done
+    [[ -n "$recipient" ]] && stage_set LIS_ENV_BACKUP_RECIPIENTS "$recipient"
+  fi
   # The passphrase that encrypts the stored copies of the deployment SSH key. Generated once on a
   # first install (shown once at the end); on recovery it must be the original one.
   if ! stage_has LIS_SSH_KEY_PASSPHRASE; then
@@ -411,6 +435,48 @@ fetch_key_from_snapshot() {
     Give it with --ssh-key PATH (or put the right passphrase in .env as LIS_SSH_KEY_PASSPHRASE).
     Only if it is truly lost: --new-ssh-key (then add the new public key to every instance, e.g.
     from Lish or rescue mode). Your instances and their data are not affected either way."
+}
+
+backup_env_encrypted() {
+  env_has LIS_ENV_BACKUP_RECIPIENTS && obj_configured || return 0
+  log "Uploading the age-encrypted copy of the settings and SSH key"
+  im env-backup || warn "the encrypted settings backup failed (see above); the scheduler retries it"
+}
+
+restore_env_backup() {  # recover --env-from-backup: every setting and the key from the age copy
+  [[ $ENV_FROM_BACKUP -eq 1 ]] || return 0
+  local file="$INSTALL_DIR/.env" ident v
+  if env_has LINODE_API_TOKEN; then
+    log "Keeping the existing credentials in $file (not restoring them from the backup)"
+    return 0
+  fi
+  umask 077
+  ENV_STAGE=$(mktemp "$INSTALL_DIR/.env.new.XXXXXX")
+  trap 'cleanup_env_stage; exit 130' INT TERM
+  if [[ -n "$ENV_FILE_IN" ]]; then cat "$ENV_FILE_IN" > "$ENV_STAGE"; elif [[ -s "$file" ]]; then cat "$file" > "$ENV_STAGE"; fi
+  if ! stage_obj_complete; then
+    [[ $ASSUME_YES -eq 0 ]] || { cleanup_env_stage; die "--env-from-backup needs the bucket settings: pass --env-file with the four LINODE_OBJ_STORAGE_* lines"; }
+    ask_object_storage
+  fi
+  stage_set LINODE_SSH_KEY_PATH "$KEY_PATH"
+  chown "$SERVICE_USER:$SERVICE_USER" "$ENV_STAGE"; chmod 600 "$ENV_STAGE"
+  mv -f "$ENV_STAGE" "$file"; ENV_STAGE=""; trap - INT TERM
+  ident=$(mktemp); chown "$SERVICE_USER" "$ident"; chmod 600 "$ident"
+  if [[ -n "$AGE_IDENTITY" ]]; then
+    [[ -r "$AGE_IDENTITY" ]] || { rm -f "$ident"; die "can't read $AGE_IDENTITY"; }
+    cat "$AGE_IDENTITY" > "$ident"
+  else
+    [[ $ASSUME_YES -eq 0 ]] || { rm -f "$ident"; die "--env-from-backup needs --age-identity PATH for a non-interactive run"; }
+    read -r -s -p "Your age identity (the AGE-SECRET-KEY-... line): " v </dev/tty; printf '\n' >/dev/tty
+    printf '%s\n' "$v" > "$ident"; v=""
+  fi
+  log "Restoring every setting and the deployment SSH key from the encrypted backup"
+  if im env-restore --identity-file "$ident" --ssh-key "$KEY_PATH" --force; then
+    rm -f "$ident"
+  else
+    rm -f "$ident"
+    die "couldn't restore from the encrypted backup (see above). Re-run without --env-from-backup to enter the settings by hand."
+  fi
 }
 
 protect_ssh_key() {
@@ -660,6 +726,7 @@ do_install() {
   check_token
   setup_ssh_key
   protect_ssh_key
+  backup_env_encrypted
   build_dashboard
   write_units
   start_services
@@ -698,6 +765,7 @@ EOF
   [[ -s "$INSTALL_DIR/state/instances.db" ]] && warn "$INSTALL_DIR already has a database -- it will be moved aside, not deleted."
   install_packages
   install_code
+  restore_env_backup
   configure_env
   check_token
   stop_services
@@ -731,6 +799,7 @@ EOF
 
   fetch_key_from_snapshot
   protect_ssh_key
+  backup_env_encrypted
 
   log "Rebuilding from Linode tags and Object Storage (adds anything newer than the snapshot)"
   im rebuild --ssh-key "$KEY_PATH" || warn "rebuild reported names it couldn't fully recover (see above)"

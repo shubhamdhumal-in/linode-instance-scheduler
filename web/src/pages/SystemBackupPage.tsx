@@ -17,6 +17,7 @@ export function SystemBackupPage() {
   const [editing, setEditing] = useState(false)
   const [form, setForm] = useState({ bucket: '', endpoint: '', access_key: '', secret_key: '' })
   const [busy, setBusy] = useState<string | null>(null)
+  const [recipientsInput, setRecipientsInput] = useState('')
   const runningRef = useRef(false)
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const reload = useCallback(() => {
@@ -313,6 +314,76 @@ export function SystemBackupPage() {
                   ))
                 })()}
               </ul>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Encrypted settings backup (age)"
+                subtitle="A copy of this deployment's settings (.env: API token, bucket keys, OAuth and alert settings, the key passphrase) and its SSH key, encrypted to your own age public key and kept in Object Storage. This host can write it but never read it back; only your age identity, kept off this host, opens it. A replacement host then needs just the bucket settings and your identity."
+                action={
+                  status.env_backup?.configured ? (
+                    <Button
+                      disabled={busy !== null}
+                      onClick={() =>
+                        act('env-backup', async () => {
+                          const r = await api.runEnvBackup()
+                          return `Encrypted settings${r.ssh_key_included ? ' and SSH key' : ''} uploaded.`
+                        })
+                      }
+                    >
+                      {busy === 'env-backup' ? 'Uploading…' : 'Back up now'}
+                    </Button>
+                  ) : undefined
+                }
+              />
+              <div className="space-y-3 px-5 py-4 text-sm text-slate-700">
+                {status.env_backup?.configured ? (
+                  <>
+                    <p>
+                      Encrypted to {status.env_backup.recipients.join(', ')} — last uploaded{' '}
+                      {status.env_backup.uploaded_at
+                        ? new Date(status.env_backup.uploaded_at).toLocaleString()
+                        : 'not yet'}
+                      .
+                    </p>
+                    {status.env_backup.last_error && (
+                      <p className="text-rose-700">Last attempt failed: {status.env_backup.last_error}</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-amber-700">Not set up.</p>
+                )}
+                <form
+                  className="flex max-w-2xl gap-2"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    void act('env-recipients', async () => {
+                      const r = await api.setEnvBackupRecipients(recipientsInput)
+                      setRecipientsInput('')
+                      if (!recipientsInput.trim()) return 'Encrypted settings backup turned off.'
+                      return r.result?.outcome === 'uploaded'
+                        ? 'Saved; first encrypted copy uploaded.'
+                        : `Saved. ${r.result?.detail ?? ''}`
+                    })
+                  }}
+                >
+                  <input
+                    className={INPUT}
+                    aria-label="Age public key"
+                    placeholder="age1… (your age public key; empty turns it off)"
+                    value={recipientsInput}
+                    onChange={(e) => setRecipientsInput(e.target.value)}
+                  />
+                  <Button type="submit" disabled={busy !== null}>
+                    {busy === 'env-recipients' ? 'Saving…' : 'Save'}
+                  </Button>
+                </form>
+                <p className="text-xs text-slate-500">
+                  Make a keypair on your own machine with <code>age-keygen -o key.txt</code> and paste only
+                  the public key (age1…) here. Keep key.txt in your password manager; recovery uses it with
+                  <code> install.sh recover --env-from-backup</code>.
+                </p>
+              </div>
             </Card>
 
             <Card>

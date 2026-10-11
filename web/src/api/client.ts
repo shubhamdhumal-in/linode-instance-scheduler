@@ -212,6 +212,20 @@ export const api = {
   },
   protectSshKey: () => request<KeyProtectionResult>('POST', '/system/ssh-key/protect'),
   getHealth: () => request<HealthStatus>('GET', '/system/health'),
+  setEnvBackupRecipients: (recipients: string) =>
+    request<{
+      status: NonNullable<SystemBackupStatus['env_backup']>
+      result: {
+        outcome: string
+        detail: string | null
+      } | null
+    }>('PUT', '/system/env-backup/recipients', { recipients }),
+  runEnvBackup: () =>
+    request<{
+      outcome: string
+      detail: string | null
+      ssh_key_included: boolean
+    }>('POST', '/system/env-backup/run'),
   testAlerts: () =>
     request<{
       results: Record<string, boolean>

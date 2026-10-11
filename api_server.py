@@ -1094,6 +1094,33 @@ def api_heal(request: Request, user: str = Depends(require_session)) -> dict:
     return dataclasses.asdict(result)
 
 
+class EnvBackupRecipientsRequest(BaseModel):
+    recipients: str
+
+
+@app.put("/system/env-backup/recipients")
+def api_env_backup_recipients(body: EnvBackupRecipientsRequest, user: str = Depends(require_session)) -> dict:
+
+    value = body.recipients.strip()
+    if value:
+        im.parse_age_recipients(value)
+    im._write_env_settings({im.ENV_BACKUP_RECIPIENTS_ENV: value or None})
+    im.record_activity(f"encrypted settings backup {'set up' if value else 'turned off'}",
+                       source="api", action="env-backup", actor=user)
+    result = im.backup_env_encrypted(force=True) if value else None
+    return {"status": im.env_backup_status(),
+            "result": dataclasses.asdict(result) if result else None}
+
+
+@app.post("/system/env-backup/run")
+def api_env_backup_run(user: str = Depends(require_session)) -> dict:
+
+    result = im.backup_env_encrypted(force=True)
+    if result.outcome == "failed":
+        raise HTTPException(502, f"encrypted settings backup failed: {result.detail}")
+    return dataclasses.asdict(result)
+
+
 @app.post("/system/ssh-key/protect")
 def api_protect_ssh_key(request: Request, user: str = Depends(require_session)) -> dict:
 
@@ -2159,7 +2186,7 @@ CONSOLE_COMMANDS = (
     "group-delete", "group-add", "group-remove", "api-token-list", "api-token-scopes",
     "api-token-revoke",
     "clear-lock", "set-vpc-address", "reset-host-key", "rebuild", "backup", "heal",
-    "migrate-abandon", "schedule-catch-up", "ssh-key-protect",
+    "migrate-abandon", "schedule-catch-up", "ssh-key-protect", "env-backup", "alerts-check",
     "backup-list", "rollback", "backup-delete", "console-session-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
 )
 CONSOLE_MAX_RUNTIME_S = 3 * 3600

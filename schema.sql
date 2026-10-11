@@ -212,3 +212,11 @@ CREATE TABLE IF NOT EXISTS alert_state (
     message TEXT NOT NULL,
     last_sent_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS env_backup_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint TEXT,
+    uploaded_at TEXT,
+    last_attempt_at TEXT,
+    last_error TEXT
+);

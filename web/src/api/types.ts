@@ -437,6 +437,12 @@ export interface SystemBackupStatus {
     updated_at: string | null
     passphrase_escrowed?: boolean
   } | null
+  env_backup?: {
+    configured: boolean
+    recipients: string[]
+    uploaded_at: string | null
+    last_error: string | null
+  } | null
 }
 export interface HealthStatus {
   problems: {

@@ -294,6 +294,7 @@ Every command below is run from the repository root, with the virtual environmen
 | `heal` | Compares every node with your account and fixes the local records where the account proves them wrong (an instance the records don't know about, a leftover from an unfinished start, a stale in-progress mark). The scheduler does this every few minutes. See §8.15. |
 | `schedule-catch-up` | Lists nodes that aren't in the state their schedule wants (after an outage longer than the scheduler's one-hour catch-up window); `--apply` starts/stops them after you confirm. See §8.15. |
 | `migrate-abandon` | Cancels an unfinished migration: the original instance boots from its own disk again and the copy's volume is deleted. See §6.4. |
+| `env-backup` / `env-restore` | Your own encrypted copy of the settings (`.env`) and the deployment SSH key, encrypted to your age public key — only you can open it. See §8.10. |
 | `alerts-check` / `alerts-test` | Show what needs attention right now (exit 1 if anything) / send a test alert. Alerts go to a webhook and/or email. See §8.15. |
 | `reset-host-key` | Admin escape hatch — re-establishes SSH trust for a node after a genuine, confirmed key change. You should rarely need this either; see [§8](#8-day-to-day-usage) and the one-time migration note below. |
 | `rebuild` | Disaster recovery — reconstructs your local registry from tags on your own Linode account, in case the machine running this tool (and its local records) is ever lost. You should rarely need this either. |
@@ -1608,6 +1609,20 @@ Storage keys or a snapshot. Check it any time:
 ```
 python instance_manager.py ssh-key-protect
 ```
+
+**Your own encrypted copy of the settings.** Set your age public key (make the keypair on your own
+machine with `age-keygen -o key.txt`) and the scheduler keeps the whole `.env` and the deployment SSH
+key in your bucket, encrypted so only your `key.txt` opens them — this host can write them but not
+read them back. They're re-uploaded whenever either changes:
+
+```
+python instance_manager.py env-backup --set-recipients age1...      # once; also on the System backup page
+python instance_manager.py env-restore --identity-file key.txt --ssh-key keys/deploy_key   # on a new host
+python instance_manager.py env-restore --identity-file key.txt --print   # just show them (e.g. for a Kubernetes Secret)
+```
+
+On a new host, `sudo ./install.sh recover --env-from-backup --age-identity key.txt` asks only for
+the bucket settings.
 
 **Moving to a new host.** If the machine running this tool is lost, `sudo ./install.sh recover` on a
 fresh one restores everything before starting anything — see `DEPLOYMENT.md` §8.1. The pieces it

@@ -170,9 +170,20 @@ test('the system backup page shows key protection, problems and sends a test ale
           updated_at: null,
           passphrase_escrowed: false,
         },
+        env_backup: { configured: false, recipients: [], uploaded_at: null, last_error: null },
       },
     }),
   )
+  let recipientsBody: Record<string, unknown> | null = null
+  await page.route('**/system/env-backup/recipients', async (r: Route) => {
+    recipientsBody = r.request().postDataJSON()
+    await r.fulfill({
+      json: {
+        status: { configured: true, recipients: ['age1abc...xyz'], uploaded_at: null, last_error: null },
+        result: { outcome: 'uploaded', detail: null },
+      },
+    })
+  })
   await page.route('**/system/health', (r: Route) =>
     r.fulfill({
       json: {
@@ -199,4 +210,13 @@ test('the system backup page shows key protection, problems and sends a test ale
   await page.getByRole('button', { name: 'Send test alert' }).click()
   await expect(page.locator('main')).toContainText('Test alert failed on: email')
   expect(tested).toBe(1)
+  await expect(page.locator('main')).toContainText('Encrypted settings backup (age)')
+  await page
+    .getByLabel('Age public key')
+    .fill('age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz5k3n7')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('main')).toContainText('first encrypted copy uploaded')
+  expect(recipientsBody).toEqual({
+    recipients: 'age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz5k3n7',
+  })
 })

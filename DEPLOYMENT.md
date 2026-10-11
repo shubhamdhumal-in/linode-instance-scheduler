@@ -177,6 +177,8 @@ Fill in:
   you don't need to set this at all.
 - **`LIS_SSH_KEY_PASSPHRASE`** — encrypts the stored copies of the deployment SSH key (§8). At
   least 12 characters; `install.sh` generates one.
+- **`LIS_ENV_BACKUP_RECIPIENTS`** — your age public key(s), for the encrypted copy of these
+  settings only you can open (§8).
 - **`LIS_ALERT_WEBHOOK_URL`, `LIS_ALERT_EMAIL_TO` and the `LIS_ALERT_SMTP_*` settings** —
   optional alerts (§8.2).
 - **`API_ALLOWED_ORIGINS`** — only needed if a browser-based client (the dashboard, or your own
@@ -405,7 +407,22 @@ backup, and the scheduler every hour do this; `ssh-key-protect` does it on deman
   only to your account's users with StackScripts access; don't run or delete it).
 
 A replacement host fetches the passphrase with the API token it needs anyway, so recovery needs
-nothing extra from you. This adds no new way in: anyone holding a full-access Linode token can
+nothing extra from you.
+
+**Your own encrypted copy of the settings (recommended).** Give `install.sh` your age public key
+(`--env-backup-recipient age1…`, or answer the question; make the keypair on your own machine with
+`age-keygen -o key.txt` and keep `key.txt` in your password manager). The scheduler then keeps
+`deployment/env.age` — the whole `.env`: API token, bucket keys, OAuth, alert settings, the key
+passphrase — and `deployment/ssh-key.age` in your bucket, encrypted to that key and re-uploaded
+whenever either changes. This host can write them but never read them back. On a replacement host
+you then enter only the bucket settings and your age identity:
+
+```
+sudo ./install.sh recover --env-from-backup --age-identity ~/key.txt
+```
+
+Set it up later with `env-backup --set-recipients age1…` or on the System backup page. The copies
+are plain age files: `age -d -i key.txt env.age` opens them anywhere. This adds no new way in: anyone holding a full-access Linode token can
 already get root on every instance (rescue mode, root password reset, Lish), and the passphrase
 opens nothing without the encrypted key, which needs your Object Storage keys or a database
 snapshot. Keeping your own copy of the passphrase (shown once at install) is still a good idea.
@@ -426,7 +443,8 @@ blank: it's fetched from your Linode account. It then, before starting anything:
 
 1. installs everything exactly as `install` does, but leaves the services stopped;
 2. fetches and decrypts the SSH key from the bucket, or from the restored database (or takes the
-   original key file with `--ssh-key <path>`);
+   original key file with `--ssh-key <path>`); with `--env-from-backup`, every setting and the key
+   come from your age-encrypted copy instead, and only the bucket settings are asked;
 3. restores the newest database snapshot from the bucket — usually the continuous one, a minute or
    so old (`--snapshot <key>` for an older one, `--from-file <path>` for a local snapshot) — and
    the trusted host keys;

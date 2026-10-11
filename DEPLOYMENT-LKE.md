@@ -100,7 +100,10 @@ exact `kubectl create secret` command). Both files are gitignored; never commit 
 Set `LIS_SSH_KEY_PASSPHRASE` to a new random value of 12+ characters (`openssl rand -base64 24`).
 It encrypts the stored copies of the deployment SSH key; the scheduler keeps its recovery copy in a
 private StackScript in your Linode account, so the API token needs StackScripts read/write. The
-optional `LIS_ALERT_*` values turn on webhook and email alerts (see `DEPLOYMENT.md` §8.2).
+optional `LIS_ALERT_*` values turn on webhook and email alerts (see `DEPLOYMENT.md` §8.2), and
+`LIS_ENV_BACKUP_RECIPIENTS` (your age public key) keeps a copy of these settings and the SSH key in
+your bucket that only you can open — `env-restore --identity-file key.txt --print` from a new pod
+turns it back into the values for a new Secret.
 
 `configmap.example.yaml` holds only non-secret tunables (poll interval/window, optional CORS
 origins) — copy it to `configmap.yaml` if you want to change the defaults, otherwise

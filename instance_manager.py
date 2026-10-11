@@ -6658,6 +6658,9 @@ def backup_full_system(
 
     key_result = protect_deployment_ssh_key(None, deployment_ssh_key_path())
     result.ssh_key_problems = key_result.problems
+    env_result = backup_env_encrypted(verify_remote=True)
+    if env_result.outcome == "failed":
+        result.ssh_key_problems.append(f"encrypted settings backup: {env_result.detail}")
     for problem in key_result.problems:
         if on_warning is not None:
             on_warning(f"  WARNING: deployment SSH key: {problem}")
@@ -6985,7 +6988,7 @@ def get_system_backup_status() -> dict:
     return {"object_storage": osb.settings_summary(),
             "local_backup_dir": str(local) if local else None,
             "last_backup": last, "continuous": continuous,
-            "ssh_key": deployment_key_status()}
+            "ssh_key": deployment_key_status(), "env_backup": env_backup_status()}
 
 
 def configure_system_backup(bucket: str, endpoint: str, access_key: str, secret_key: str, *,
@@ -7480,6 +7483,206 @@ def restore_ssh_key_from_database(dest: Path, passphrase: str, *, force: bool = 
     return dest
 
 
+ENV_BACKUP_RECIPIENTS_ENV = "LIS_ENV_BACKUP_RECIPIENTS"
+ENV_BACKUP_OBJECT_NAME = "env.age"
+SSH_KEY_AGE_OBJECT_NAME = "ssh-key.age"
+
+_ENV_BACKUP_KEYS = (
+    "LINODE_API_TOKEN", "LINODE_OAUTH_CLIENT_ID", "LINODE_OAUTH_CLIENT_SECRET",
+    "LINODE_OAUTH_REDIRECT_URI", "LINODE_SSH_KEY_PATH", "LINODE_API_MAX_REQUESTS_PER_SECOND",
+    "ACTIVITY_LOG_RETENTION_DAYS", "API_ALLOWED_ORIGINS", "LINODE_OBJ_STORAGE_BUCKET",
+    "LINODE_OBJ_STORAGE_ENDPOINT", "LINODE_OBJ_STORAGE_ACCESS_KEY", "LINODE_OBJ_STORAGE_SECRET_KEY",
+    "LIS_SSH_KEY_PASSPHRASE", "LIS_BACKUP_KEEP_ALL_HOURS", "LIS_BACKUP_KEEP_DAILY_DAYS",
+    "LIS_ALERT_WEBHOOK_URL", "LIS_ALERT_EMAIL_TO", "LIS_ALERT_SMTP_HOST", "LIS_ALERT_SMTP_PORT",
+    "LIS_ALERT_SMTP_SECURITY", "LIS_ALERT_SMTP_USER", "LIS_ALERT_SMTP_PASSWORD",
+    "LIS_ALERT_EMAIL_FROM", "LIS_ENV_BACKUP_RECIPIENTS", "LINODE_SCHEDULER_BACKUP_DIR",
+)
+ENV_BACKUP_STALE_SECONDS = 15 * 60
+
+
+def parse_age_recipients(text: str | None) -> list:
+
+    from pyrage import x25519
+    out = []
+    for item in re.split(r"[\s,]+", (text or "").strip()):
+        if not item:
+            continue
+        try:
+            out.append(x25519.Recipient.from_str(item))
+        except Exception as e:
+            raise engine.ConfigError(f"'{item[:20]}...' isn't an age public key (age1...): {e}") from e
+    return out
+
+
+def _parse_age_identities(text: str) -> list:
+    from pyrage import x25519
+    ids = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("AGE-SECRET-KEY-"):
+            try:
+                ids.append(x25519.Identity.from_str(line))
+            except Exception as e:
+                raise engine.ConfigError(f"an AGE-SECRET-KEY line isn't valid: {e}") from e
+    if not ids:
+        raise engine.ConfigError("no age identity (a line starting AGE-SECRET-KEY-) was given.")
+    return ids
+
+
+def _env_backup_source() -> bytes:
+    if ENV_PATH.is_file():
+        return ENV_PATH.read_bytes()
+    lines = [f"{k}={os.environ[k]}" for k in _ENV_BACKUP_KEYS if os.environ.get(k)]
+    return ("\n".join(lines) + "\n").encode() if lines else b""
+
+
+def _env_backup_row() -> tuple | None:
+    def _do():
+        conn = _connect()
+        try:
+            return conn.execute("SELECT fingerprint, uploaded_at, last_attempt_at, last_error "
+                                "FROM env_backup_status WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+
+    return _retry_db(_do)
+
+
+def _set_env_backup_row(**fields) -> None:
+    def _do():
+        conn = _connect()
+        try:
+            conn.execute("INSERT OR IGNORE INTO env_backup_status (id) VALUES (1)")
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE env_backup_status SET {sets} WHERE id = 1", tuple(fields.values()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_db(_do)
+
+
+@dataclass
+class EnvBackupResult:
+    outcome: str
+    detail: str | None = None
+    ssh_key_included: bool = False
+
+
+def backup_env_encrypted(*, force: bool = False, verify_remote: bool = False) -> EnvBackupResult:
+
+    try:
+        recipients = parse_age_recipients(os.environ.get(ENV_BACKUP_RECIPIENTS_ENV))
+    except engine.ConfigError as e:
+        _record_env_backup_failure(str(e))
+        return EnvBackupResult("failed", str(e))
+    if not recipients:
+        return EnvBackupResult("not_configured")
+    if not osb.is_configured():
+        return EnvBackupResult("not_configured", "needs Object Storage")
+    import pyrage
+    data = _env_backup_source()
+    key_path = deployment_ssh_key_path()
+    key_bytes = key_path.read_bytes() if key_path.is_file() else b""
+    fingerprint = hashlib.sha256(
+        data + b"\0" + key_bytes + b"\0"
+        + os.environ.get(ENV_BACKUP_RECIPIENTS_ENV, "").encode()).hexdigest()
+    try:
+        row = _env_backup_row()
+        if (not force and row is not None and row[0] == fingerprint
+                and (not verify_remote
+                     or osb.download_deployment_file(ENV_BACKUP_OBJECT_NAME) is not None)):
+            return EnvBackupResult("already_current", ssh_key_included=bool(key_bytes))
+        _set_env_backup_row(last_attempt_at=datetime.now(UTC).isoformat())
+        osb.upload_deployment_file(ENV_BACKUP_OBJECT_NAME, pyrage.encrypt(data, recipients))
+        if key_bytes:
+            osb.upload_deployment_file(SSH_KEY_AGE_OBJECT_NAME, pyrage.encrypt(key_bytes, recipients))
+        _set_env_backup_row(fingerprint=fingerprint, uploaded_at=datetime.now(UTC).isoformat(),
+                            last_error=None)
+        return EnvBackupResult("uploaded", ssh_key_included=bool(key_bytes))
+    except Exception as e:
+        _record_env_backup_failure(str(e))
+        return EnvBackupResult("failed", str(e))
+
+
+def _record_env_backup_failure(message: str) -> None:
+    with contextlib_suppress(Exception):
+        _set_env_backup_row(last_error=message[:500], last_attempt_at=datetime.now(UTC).isoformat())
+
+
+def env_backup_status() -> dict:
+    configured = bool(os.environ.get(ENV_BACKUP_RECIPIENTS_ENV, "").strip())
+    row = None
+    with contextlib_suppress(Exception):
+        row = _env_backup_row()
+    recipients = [r for r in re.split(r"[\s,]+", os.environ.get(ENV_BACKUP_RECIPIENTS_ENV, "")) if r]
+    return {"configured": configured, "recipients": [r[:12] + "..." + r[-6:] for r in recipients],
+            "uploaded_at": row[1] if row else None, "last_error": row[3] if row else None}
+
+
+@dataclass
+class EnvRestoreResult:
+    keys: list[str]
+    written_to: str | None
+    ssh_key_written_to: str | None
+    text: str | None = None
+
+
+def restore_env_from_backup(
+    identity_text: str, *, dest: Path | None = None, ssh_key_dest: Path | None = None,
+    keep: Collection[str] = (), force: bool = False, print_only: bool = False,
+) -> EnvRestoreResult:
+
+    import pyrage
+    if not osb.is_configured():
+        raise engine.ConfigError("Object Storage isn't configured -- the bucket settings are needed "
+                                 "to fetch the backup.")
+    identities = _parse_age_identities(identity_text)
+    blob = osb.download_deployment_file(ENV_BACKUP_OBJECT_NAME)
+    if blob is None:
+        raise engine.ConfigError("no encrypted .env backup in Object Storage (deployment/env.age).")
+    try:
+        plain = pyrage.decrypt(blob, identities).decode()
+    except Exception as e:
+        raise engine.ConfigError("this age identity can't decrypt the backup (wrong key?).") from e
+    if print_only:
+        return EnvRestoreResult(keys=[], written_to=None, ssh_key_written_to=None, text=plain)
+    import io
+    restored = {k: v for k, v in dotenv_values(stream=io.StringIO(plain)).items() if v is not None}
+    dest = dest or ENV_PATH
+    current = dotenv_values(dest) if dest.exists() else {}
+    if current.get("LINODE_API_TOKEN") and not force:
+        raise engine.ConfigError(f"{dest} already has an API token -- pass --force to replace it.")
+    for key in keep:
+        value = current.get(key)
+        if value:
+            restored[key] = value
+    tmp = dest.with_name(dest.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in restored.items()))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    key_written = None
+    if ssh_key_dest is not None:
+        key_blob = osb.download_deployment_file(SSH_KEY_AGE_OBJECT_NAME)
+        if key_blob is not None:
+            private_key = pyrage.decrypt(key_blob, identities)
+            if ssh_key_dest.exists() and ssh_key_dest.read_bytes() != private_key and not force:
+                raise engine.ConfigError(
+                    f"{ssh_key_dest} already holds a different key -- pass --force to replace it.")
+            ssh_key_dest.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(ssh_key_dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(private_key)
+            ssh_key_dest.chmod(0o600)
+            pub = _public_key_text(ssh_key_dest, private_key)
+            if pub:
+                ssh_key_dest.with_name(ssh_key_dest.name + ".pub").write_text(pub + "\n")
+            key_written = str(ssh_key_dest)
+    return EnvRestoreResult(keys=sorted(restored), written_to=str(dest), ssh_key_written_to=key_written)
+
+
 @dataclass
 class RestoreResult:
     source: str
@@ -7767,6 +7970,67 @@ def cmd_ssh_key_restore(args) -> int:
         if getattr(args, "save_passphrase", False):
             _write_env_settings({SSH_KEY_PASSPHRASE_ENV: passphrase})
             print(f"Saved it to .env as {SSH_KEY_PASSPHRASE_ENV}.")
+    return 0
+
+
+def cmd_env_backup(args) -> int:
+    if args.set_recipients is not None:
+        try:
+            if args.set_recipients.strip():
+                parse_age_recipients(args.set_recipients)
+        except engine.ConfigError as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
+        _write_env_settings({ENV_BACKUP_RECIPIENTS_ENV: args.set_recipients.strip() or None})
+        print("Recipients saved." if args.set_recipients.strip() else "Encrypted settings backup turned off.")
+        if not args.set_recipients.strip():
+            return 0
+    result = backup_env_encrypted(force=True)
+    if result.outcome == "not_configured":
+        print(f"Not set up: {result.detail or f'set {ENV_BACKUP_RECIPIENTS_ENV} (your age public key) first -- env-backup --set-recipients age1...'}",
+              file=sys.stderr)
+        return 1
+    if result.outcome == "failed":
+        print(f"Configuration error: {result.detail}", file=sys.stderr)
+        return 1
+    print(f"Encrypted copy of the settings{' and the deployment SSH key' if result.ssh_key_included else ''} "
+          f"uploaded to Object Storage (deployment/{ENV_BACKUP_OBJECT_NAME}). Only your age identity "
+          "opens it; this host can't.")
+    return 0
+
+
+def cmd_env_restore(args) -> int:
+    try:
+        text = sys.stdin.read() if args.identity_file == "-" else Path(args.identity_file).read_text()
+        result = restore_env_from_backup(
+            text, ssh_key_dest=Path(args.ssh_key) if args.ssh_key else None,
+            keep=("LINODE_OBJ_STORAGE_BUCKET", "LINODE_OBJ_STORAGE_ENDPOINT",
+                  "LINODE_OBJ_STORAGE_ACCESS_KEY", "LINODE_OBJ_STORAGE_SECRET_KEY",
+                  "LINODE_SSH_KEY_PATH"),
+            force=args.force, print_only=args.print)
+    except (engine.ConfigError, OSError) as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    except osb.ObjectStorageError as e:
+        print(f"Object Storage error: {e}", file=sys.stderr)
+        return 1
+    if args.print:
+        sys.stdout.write(result.text or "")
+        return 0
+    print(f"Restored {len(result.keys)} setting(s) to {result.written_to}.")
+    if result.ssh_key_written_to:
+        print(f"Deployment SSH key restored to {result.ssh_key_written_to}.")
+    return 0
+
+
+def cmd_env_backup_keygen(args) -> int:
+    from pyrage import x25519
+    identity = x25519.Identity.generate()
+    print("# Store this whole file somewhere safe and OFF this host (a password manager). It's the")
+    print("# only thing that can open the encrypted settings backup. Generating it on your own machine")
+    print("# with `age-keygen` is better still: then the secret never touches this host.")
+    print(f"# public key: {identity.to_public()}")
+    print(str(identity))
     return 0
 
 
@@ -9338,6 +9602,9 @@ class PollScheduler:
 
         with contextlib_suppress(Exception):
             run_continuous_backup_if_due(now=now)
+        with contextlib_suppress(Exception):
+            backup_env_encrypted(verify_remote=self._last_key_protect is None
+                                 or (now - self._last_key_protect).total_seconds() >= 3600)
         if (self._last_reconcile is None
                 or (now - self._last_reconcile).total_seconds() >= RECONCILE_INTERVAL_SECONDS):
             self._last_reconcile = now
@@ -10161,6 +10428,11 @@ def check_health(*, now: datetime | None = None, include_scheduler: bool = True)
         if missing:
             problems.append(HealthProblem(
                 "ssh-key", "the deployment SSH key isn't fully protected: " + ", ".join(missing)))
+    with contextlib_suppress(Exception):
+        env = env_backup_status()
+        if env["configured"] and env["last_error"]:
+            problems.append(HealthProblem(
+                "env-backup", f"the encrypted settings (.env) backup is failing: {env['last_error'][:200]}"))
     with contextlib_suppress(Exception):
         off = [m for m in find_schedule_mismatches(now=now) if not m.changed_by_hand]
         if off:
@@ -13533,6 +13805,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
                             help=f"If the passphrase came from the Linode account's recovery copy, "
                             f"write it to .env ({SSH_KEY_PASSPHRASE_ENV}).")
     p_ = subparsers.add_parser(
+        "env-backup",
+        help="Upload an age-encrypted copy of the settings (.env) and the deployment SSH key to "
+        f"Object Storage, encrypted to your age public key(s) ({ENV_BACKUP_RECIPIENTS_ENV}); done "
+        "automatically whenever they change. Only your age identity can open it.")
+    p_.add_argument("--set-recipients", metavar="AGE_PUBLIC_KEYS",
+                    help="Save your age public key(s) (age1..., comma-separated); empty turns it off.")
+    p_ = subparsers.add_parser(
+        "env-restore",
+        help="On a replacement host: decrypt the settings backup with your age identity into .env "
+        "(bucket settings and the key path already in .env are kept), plus the SSH key.")
+    p_.add_argument("--identity-file", required=True, metavar="PATH",
+                    help="File with your AGE-SECRET-KEY line ('-' reads it from stdin).")
+    p_.add_argument("--ssh-key", metavar="PATH", help="Also restore the deployment SSH key here.")
+    p_.add_argument("--force", action="store_true", help="Replace an existing .env / key.")
+    p_.add_argument("--print", action="store_true", help="Print the settings instead of writing .env "
+                    "(e.g. to recreate a Kubernetes Secret).")
+    subparsers.add_parser(
+        "env-backup-keygen",
+        help="Print a new age keypair for the settings backup (better: run age-keygen on your own machine).")
+    p_ = subparsers.add_parser(
         "ssh-key-protect",
         help="Keep the deployment SSH key recoverable: store it encrypted (passphrase from "
         f"{SSH_KEY_PASSPHRASE_ENV} in .env) in the database and Object Storage, and register the "
@@ -13715,6 +14007,12 @@ def _route(args) -> int:
         return cmd_clear_lock(args)
     if args.command == "alerts-check":
         return cmd_alerts_check(args)
+    if args.command == "env-backup":
+        return cmd_env_backup(args)
+    if args.command == "env-restore":
+        return cmd_env_restore(args)
+    if args.command == "env-backup-keygen":
+        return cmd_env_backup_keygen(args)
     if args.command == "alerts-test":
         return cmd_alerts_test(args)
     if args.command == "deregister":
