@@ -436,6 +436,19 @@ caddyfile_is_stock() {  # the package's placeholder config (serves /usr/share/ca
   grep -q '/usr/share/caddy' <<<"$content" && [[ $(grep -cE '\{[[:space:]]*$' <<<"$content") -le 1 ]]
 }
 
+# This host's addresses, one per line: its own interfaces plus, through the Linode API, every
+# public address of the instance it runs on (a VPC 1:1 NAT address isn't on any interface).
+host_addresses() {
+  hostname -I | tr ' ' '\n'
+  (cd "$INSTALL_DIR" && runuser -u "$SERVICE_USER" -- "$PY" - 2>/dev/null <<'EOF') || true
+from dotenv import load_dotenv
+load_dotenv(".env")
+import linode_engine as engine
+import instance_manager as im
+print("\n".join(sorted(im.scheduler_host_addresses(engine.build_client(engine.load_token())))))
+EOF
+}
+
 setup_https() {
   [[ -n "$DOMAIN" ]] || DOMAIN=$(caddy_managed_domain)  # a re-run keeps the earlier domain
   [[ -n "$DOMAIN" ]] || return 0
@@ -461,7 +474,7 @@ setup_https() {
   resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
   if [[ -z "$resolved" ]]; then
     warn "$DOMAIN doesn't resolve yet -- create an A record pointing at this host's public IP; Caddy keeps retrying"
-  elif ! hostname -I | tr ' ' '\n' | grep -qx "$resolved"; then
+  elif ! host_addresses | grep -qx "$resolved"; then
     warn "$DOMAIN resolves to $resolved, which isn't an address of this host -- point its A record here; Caddy keeps retrying"
   fi
 

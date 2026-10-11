@@ -9733,6 +9733,21 @@ def _local_ipv4_addresses() -> set[str]:
     return {a for a in out.split() if "." in a}
 
 
+def scheduler_host_addresses(client) -> set[str]:
+
+    local = _local_ipv4_addresses()
+    instances = engine.retry_transient(lambda: list(client.linode.instances()))
+    vpc_ips = engine.retry_transient(lambda: list(client.vpcs.ips()))
+    own = {i.id for i in instances if local & set(i.ipv4 or [])}
+    own |= {ip.linode_id for ip in vpc_ips if ip.address in local and ip.linode_id}
+    addresses = set(local)
+    for inst in instances:
+        if inst.id in own:
+            addresses |= set(inst.ipv4 or [])
+    addresses |= {ip.nat_1_1 for ip in vpc_ips if ip.linode_id in own and getattr(ip, "nat_1_1", None)}
+    return addresses
+
+
 def _vlan_labels(network_config: list[dict] | None, model: str | None) -> list[str]:
     labels = []
     for iface in network_config or []:
