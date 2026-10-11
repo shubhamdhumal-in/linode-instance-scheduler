@@ -73,6 +73,11 @@ function BackupRow({ backup, onChanged }: { backup: MigrationBackup; onChanged: 
       )
       if (result.outcome === 'incomplete') {
         setError(`Not fully deleted: ${result.problems.join('; ')}`)
+      } else if (result.outcome === 'pending_deletion' && result.pending_deletion) {
+        setDone(
+          `Nothing has been deleted yet: the backup instance and its cloned volumes are deleted automatically on ${new Date(result.pending_deletion.due_at).toLocaleDateString()}. To keep it after all, or delete it now, go to Pending deletion.`,
+        )
+        setMode('idle')
       } else {
         onChanged()
       }
@@ -174,7 +179,7 @@ function BackupRow({ backup, onChanged }: { backup: MigrationBackup; onChanged: 
           <p className="text-sm text-rose-900">
             {backup.status === 'restored'
               ? 'Only the record is removed; nothing on Linode changes.'
-              : 'This permanently deletes the backup instance and its cloned volumes. You can no longer roll back after this.'}
+              : 'This deletes the backup instance and its cloned volumes after a 7-day wait on the Pending deletion page, where you can still keep it. You can no longer roll back once it is deleted.'}
           </p>
           <TypeToConfirmInput
             id={`del-${backup.name}`}

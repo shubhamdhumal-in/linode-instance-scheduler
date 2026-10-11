@@ -44,6 +44,8 @@ NO_START=0
 # this official release is downloaded from nodejs.org, checked against its published SHA-256,
 # used for the build only, and removed afterwards.
 NODE_BUILD_VERSION="22.12.0"
+PREBUILT_RELEASE=0
+DRILL=0
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2; }
@@ -102,6 +104,9 @@ Options:
                             review `instance_manager.py list` first; then run `install.sh start`
   --backup-schedule WHEN    hourly (default) or daily
   --backup-keep-days N      Local snapshots to keep, in days (default 14)
+  --drill                   recover: a recovery drill on a throwaway host -- restores everything
+                            and checks it would work, but changes nothing anywhere: no lease
+                            take-over, no rebuild/heal, no uploads, no services started
   --yes                     Don't ask for confirmation
 EOF
 }
@@ -136,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     --backup-keep-days) BACKUP_KEEP_DAYS="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --no-start) NO_START=1; shift ;;
+    --drill) DRILL=1; NO_START=1; ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -199,18 +205,42 @@ install_code() {
     useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
   mkdir -p "$INSTALL_DIR"
+  # A release copy from Object Storage (`release-backup`) carries its built dashboard and a wheel
+  # of every dependency, so it installs with no GitHub, PyPI or Node.js download.
+  if [[ -d "$SRC_DIR/wheels" && -f "$SRC_DIR/web/dist/index.html" ]]; then
+    PREBUILT_RELEASE=1
+    log "Installing from a release copy (bundled dashboard and dependency wheels)"
+  fi
   if [[ "$SRC_DIR" != "$INSTALL_DIR" ]]; then
     log "Copying the code to $INSTALL_DIR"
-    rsync -a --delete \
-      --exclude .git --exclude .venv --exclude .env --exclude state --exclude keys \
-      --exclude backups --exclude web/node_modules --exclude web/dist \
-      "$SRC_DIR/" "$INSTALL_DIR/"
+    local excludes=(--exclude .git --exclude .venv --exclude .env --exclude state --exclude keys
+                    --exclude backups --exclude web/node_modules)
+    [[ $PREBUILT_RELEASE -eq 1 ]] || excludes+=(--exclude web/dist)
+    rsync -a --delete "${excludes[@]}" "$SRC_DIR/" "$INSTALL_DIR/"
+  fi
+  if command -v git >/dev/null && git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$SRC_DIR" describe --tags --always --dirty > "$INSTALL_DIR/VERSION" 2>/dev/null || true
   fi
   mkdir -p "$INSTALL_DIR/state" "$INSTALL_DIR/keys" "$BACKUP_DIR"
   log "Setting up the Python environment"
   [[ -x "$PY" ]] || python3 -m venv "$INSTALL_DIR/.venv"
-  "$INSTALL_DIR/.venv/bin/pip" install -q --upgrade pip
-  "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+  if [[ -d "$INSTALL_DIR/wheels" ]]; then
+    "$INSTALL_DIR/.venv/bin/pip" install -q --no-index --find-links "$INSTALL_DIR/wheels" \
+      --require-hashes -r "$INSTALL_DIR/requirements.lock" \
+      || { warn "the bundled dependency wheels don't fit this host (another platform or Python) -- installing from PyPI instead"
+           "$INSTALL_DIR/.venv/bin/pip" install -q --require-hashes -r "$INSTALL_DIR/requirements.lock" \
+             || die "dependency install failed"; }
+  else
+    "$INSTALL_DIR/.venv/bin/pip" install -q --upgrade pip
+    # Every dependency pinned to an exact version and checked against its published hash, so what
+    # installs is exactly what was released and tested.
+    if [[ -f "$INSTALL_DIR/requirements.lock" ]]; then
+      "$INSTALL_DIR/.venv/bin/pip" install -q --require-hashes -r "$INSTALL_DIR/requirements.lock" \
+        || die "dependency install failed (a downloaded package didn't match its published hash, or no network)"
+    else
+      "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+    fi
+  fi
   chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
   chmod 750 "$INSTALL_DIR"
   chmod 700 "$INSTALL_DIR/keys" "$BACKUP_DIR" "$INSTALL_DIR/state"
@@ -515,6 +545,11 @@ node_is_new_enough() {  # node_is_new_enough PATH_TO_NODE
 build_dashboard() {
   [[ $WITH_API -eq 1 && $WITH_DASHBOARD -eq 1 ]] || return 0
   [[ -d "$INSTALL_DIR/web" ]] || return 0
+  if [[ $PREBUILT_RELEASE -eq 1 ]]; then
+    log "Using the dashboard built into this release copy"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/web"
+    return 0
+  fi
   local node_dir="" tmp=""
   if command -v node >/dev/null && command -v npm >/dev/null && node_is_new_enough "$(command -v node)"; then
     node_dir="$(dirname "$(command -v node)")"
@@ -782,7 +817,27 @@ EOF
   fi
 }
 
+do_drill() {
+  # Read-only restore + verification (a throwaway host; see `recovery-drill`).
+  install_packages
+  install_code
+  restore_env_backup
+  configure_env
+  grep -q '^LIS_RECOVERY_DRILL=' "$INSTALL_DIR/.env" || echo "LIS_RECOVERY_DRILL=1" >> "$INSTALL_DIR/.env"
+  check_token
+  setup_ssh_key
+  local args=(restore --force --yes)
+  [[ -n "$SNAPSHOT" ]] && args+=(--snapshot "$SNAPSHOT")
+  [[ -n "$FROM_FILE" ]] && args+=(--from-file "$FROM_FILE")
+  log "Drill: restoring the database snapshot"
+  im "${args[@]}" || die "drill: the snapshot couldn't be restored"
+  fetch_key_from_snapshot
+  log "Drill: checking the restored deployment would work (read-only)"
+  im recovery-drill-check --report /tmp/recovery-drill-report.json
+}
+
 do_recover() {
+  if [[ $DRILL -eq 1 ]]; then do_drill; return $?; fi
   cat <<EOF
 
   Recovery sets this host up as the replacement for a lost one. Make sure the OLD host is shut

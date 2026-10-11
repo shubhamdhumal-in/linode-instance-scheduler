@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import weakref
 import time
 import types
 import uuid
@@ -350,8 +351,22 @@ def install_request_pacing(client: LinodeClient) -> LinodeClient:
     return client
 
 
+_BUILT_CLIENTS: weakref.WeakSet[LinodeClient] = weakref.WeakSet()
+
+
 def build_client(token: str) -> LinodeClient:
-    return install_request_pacing(LinodeClient(token))
+    client = install_request_pacing(LinodeClient(token))
+    _BUILT_CLIENTS.add(client)
+    return client
+
+
+def set_token_on_clients(token: str) -> int:
+
+    count = 0
+    for client in list(_BUILT_CLIENTS):
+        client.token = token
+        count += 1
+    return count
 
 
 def auth_check(client: LinodeClient) -> None:
@@ -1529,6 +1544,33 @@ def known_hosts_file_lock(known_hosts_path: str | Path | None = None):
             fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+PREVIOUS_SSH_KEY_ENV = "LINODE_SSH_PREVIOUS_KEY_PATH"
+
+
+_identity_override = threading.local()
+
+
+@contextmanager
+def only_this_ssh_key():
+
+    _identity_override.only = True
+    try:
+        yield
+    finally:
+        _identity_override.only = False
+
+
+def ssh_identity_args(ssh_key_path) -> list[str]:
+
+    args = ["-i", str(ssh_key_path)]
+    if getattr(_identity_override, "only", False):
+        return args + ["-o", "IdentitiesOnly=yes"]
+    previous = os.environ.get(PREVIOUS_SSH_KEY_ENV, "").strip()
+    if previous and Path(previous).is_file() and str(Path(previous)) != str(Path(ssh_key_path)):
+        args += ["-i", previous]
+    return args
+
+
 def ssh_run(
     host: str,
     ssh_key_path: str | None,
@@ -1572,7 +1614,7 @@ def ssh_run(
 
 
                 "-o", "HashKnownHosts=no",
-                "-i", ssh_key_path,
+                *ssh_identity_args(ssh_key_path),
                 f"root@{host}",
                 remote_command,
             ],
@@ -1636,7 +1678,7 @@ def ssh_exec(
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", f"UserKnownHostsFile={known_hosts_path}",
                 "-o", "HashKnownHosts=no",
-                "-i", ssh_key_path,
+                *ssh_identity_args(ssh_key_path),
                 f"root@{host}",
                 command,
             ],
@@ -2265,7 +2307,7 @@ def _lish_spawn(username: str, region: str, instance_label: str, ssh_key_path: s
     Path(known_hosts_path).parent.mkdir(parents=True, exist_ok=True)
     child = pexpect.spawn(
         "ssh",
-        ["-t", "-i", ssh_key_path, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+        ["-t", *ssh_identity_args(ssh_key_path), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
          "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known_hosts_path}",
          "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6",
          f"{username}@{lish_gateway(region)}", instance_label],

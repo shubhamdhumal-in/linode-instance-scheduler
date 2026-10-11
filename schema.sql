@@ -236,3 +236,33 @@ CREATE TABLE IF NOT EXISTS scheduler_lease_state (
     holder_renewed_at TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_deletions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('node', 'migration_backup')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'deleted', 'recovered', 'failed')),
+    created_at TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    resources TEXT NOT NULL,
+    bundle TEXT,
+    detail TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS key_rotation (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    started_at TEXT NOT NULL,
+    previous_blob BLOB NOT NULL,
+    previous_fingerprint TEXT NOT NULL,
+    previous_public_key TEXT NOT NULL,
+    new_public_key TEXT NOT NULL,
+    previous_linode_ssh_key_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS key_rotation_nodes (
+    name TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed')),
+    detail TEXT,
+    updated_at TEXT NOT NULL
+);

@@ -9,6 +9,7 @@ import {
   type Schedule,
   type ScheduleEvent,
   type ScheduleGroupSummary,
+  type PendingDeletion,
 } from '../api/types'
 import { ActivityFeed } from '../components/ActivityFeed'
 import { HooksCard } from '../components/HooksCard'
@@ -64,6 +65,7 @@ export function InstanceDetailPage() {
   const [offboardError, setOffboardError] = useState<string | null>(null)
   const [offboardErrorWarnings, setOffboardErrorWarnings] = useState<string[] | null>(null)
   const [offboardSuccessWarnings, setOffboardSuccessWarnings] = useState<string[] | null>(null)
+  const [offboardPending, setOffboardPending] = useState<PendingDeletion | null>(null)
   const [stopConfirming, setStopConfirming] = useState(false)
   const [stopConfirmName, setStopConfirmName] = useState('')
   const [pendingGroupRemoval, setPendingGroupRemoval] = useState(false)
@@ -91,6 +93,7 @@ export function InstanceDetailPage() {
     setOffboardError(null)
     setOffboardErrorWarnings(null)
     setOffboardSuccessWarnings(null)
+    setOffboardPending(null)
     setDeregisterError(null)
     return () => {
       currentNameRef.current = null
@@ -124,7 +127,11 @@ export function InstanceDetailPage() {
       .then(setGroups)
       .catch(() => setGroups([]))
   }, [name])
-  usePolling(reload, POLL_INTERVAL_MS, busy === null && offboardSuccessWarnings === null)
+  usePolling(
+    reload,
+    POLL_INTERVAL_MS,
+    busy === null && offboardSuccessWarnings === null && offboardPending === null,
+  )
   const run = async (
     label: string,
     fn: (
@@ -205,7 +212,10 @@ export function InstanceDetailPage() {
         api.offboardInstance(name, deleteVolumes),
       )
       if (requestedName !== currentNameRef.current) return
-      if (result.outcome === 'offboarded') {
+      if (result.outcome === 'pending_deletion' && result.pending_deletion) {
+        setOffboardPending(result.pending_deletion)
+        if (result.warnings && result.warnings.length > 0) setOffboardSuccessWarnings(result.warnings)
+      } else if (result.outcome === 'offboarded') {
         if (result.warnings && result.warnings.length > 0) {
           setOffboardSuccessWarnings(result.warnings)
         } else {
@@ -757,7 +767,39 @@ export function InstanceDetailPage() {
           <Card className="border-red-200">
             <CardHeader title="Danger zone" subtitle="Permanently stop managing this instance." />
             <div className="space-y-3 px-5 py-4">
-              {offboardSuccessWarnings ? (
+              {offboardPending ? (
+                <>
+                  <div className="rounded-md bg-emerald-50 px-3 py-3 text-sm text-emerald-800 ring-1 ring-inset ring-emerald-200">
+                    “{name}” is offboarded and no longer managed.
+                  </div>
+                  {offboardSuccessWarnings && <WarningBanner messages={offboardSuccessWarnings} />}
+                  <div
+                    className="rounded-md bg-amber-50 px-3 py-3 text-sm text-amber-900 ring-1 ring-inset ring-amber-200"
+                    data-testid="offboard-pending-notice"
+                  >
+                    Nothing has actually been deleted yet. Its{' '}
+                    {offboardPending.resources
+                      .map((r) => (r.type === 'ip' ? 'reserved IP' : `${r.role} volume`))
+                      .join(', ')}{' '}
+                    are kept until {new Date(offboardPending.due_at).toLocaleDateString()}, then{' '}
+                    {offboardPending.resources.some((r) => r.type === 'volume' && r.action === 'delete')
+                      ? 'deleted automatically'
+                      : 'the reserved IP is released automatically (volumes are kept)'}
+                    . To recover “{name}”, or to delete it now instead of waiting, go to{' '}
+                    <button
+                      type="button"
+                      className="font-medium underline"
+                      onClick={() => navigate('/pending-deletions')}
+                    >
+                      Pending deletion
+                    </button>
+                    .
+                  </div>
+                  <Button variant="primary" className="w-full" onClick={() => navigate('/instances')}>
+                    Continue
+                  </Button>
+                </>
+              ) : offboardSuccessWarnings ? (
                 <>
                   <div className="rounded-md bg-emerald-50 px-3 py-3 text-sm text-emerald-800 ring-1 ring-inset ring-emerald-200">
                     Offboarded successfully — but review this first:
@@ -780,7 +822,12 @@ export function InstanceDetailPage() {
                     />
                     Also permanently delete its OS + data volumes
                   </label>
+                  <p className="text-xs text-slate-500">
+                    Nothing is deleted right away: the node waits on the Pending deletion page for 7 days,
+                    where you can recover it or delete it sooner.
+                  </p>
                   <TypeToConfirmInput
+                    id="offboard-confirm"
                     expected={name}
                     value={confirmName}
                     onChange={setConfirmName}

@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import type { Route } from '@playwright/test'
-import { loginAs, mockGroupList } from './mocks'
+import { baseInstanceRecord, loginAs, mockGroupList, mockInstanceList } from './mocks'
 test('creating an API token shows it once and lists it without the secret', async ({ page }) => {
   await loginAs(page)
   const tokens: Array<Record<string, unknown>> = []
@@ -27,15 +27,44 @@ test('creating an API token shows it once and lists it without the secret', asyn
     }
     await route.fulfill({ json: tokens })
   })
+  await page.route('**/tokens/scopes', (route: Route) =>
+    route.fulfill({
+      json: {
+        bundles: { read: ['instances:list'], operate: ['instances:start'], configure: [], admin: [] },
+        operations: [
+          { value: 'instances:start', description: 'start an instance' },
+          { value: 'deletions:recover', description: 'recover a node or backup pending deletion' },
+        ],
+      },
+    }),
+  )
+  await mockInstanceList(page, {
+    'web-1': baseInstanceRecord(),
+    'db-1': baseInstanceRecord({ schedule_mode: 'manual' }),
+  })
+  await mockGroupList(page, [
+    { id: 1, name: 'dev', timezone: 'UTC', rules: [], enabled: true, member_count: 0 },
+    { id: 2, name: 'prod', timezone: 'UTC', rules: [], enabled: true, member_count: 0 },
+  ])
   await page.goto('/ui/#/tokens')
   await page.getByLabel('Token name').fill('ci-deploy')
-  await page.getByLabel('Allowed groups').fill('dev')
+  await page.getByRole('button', { name: 'Only these groups' }).click()
+  await page.getByRole('option').getByText('dev', { exact: true }).click()
+  await page.getByRole('button', { name: 'Done' }).click()
+  await page.getByRole('button', { name: 'Only these nodes' }).click()
+  await expect(page.getByRole('option').getByText('manual-only')).toBeVisible()
+  await page.getByLabel('Search Only these nodes').fill('db')
+  await expect(page.getByRole('option')).toHaveCount(1)
+  await page.getByRole('option').getByText('db-1').click()
+  await page.getByRole('button', { name: 'Done' }).click()
+  await page.getByText('Or pick single operations').click()
+  await expect(page.getByLabel('deletions:recover')).toBeVisible()
   await page.getByRole('button', { name: 'Create token' }).click()
   await expect(page.getByLabel('New token')).toHaveText('lis_secret-value-shown-once')
   expect(createBody).toEqual({
     name: 'ci-deploy',
     scopes: ['read', 'operate'],
-    instances: null,
+    instances: ['db-1'],
     groups: ['dev'],
     expires_days: null,
   })

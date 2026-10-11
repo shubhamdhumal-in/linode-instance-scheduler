@@ -29,6 +29,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Literal, TypeGuard
 from zoneinfo import ZoneInfo
@@ -2555,6 +2556,14 @@ def onboard_instance(
         registry = load_registry()
         if name in registry and not force:
             raise engine.AlreadyOnboardedError(name)
+        pending = pending_deletion_for(name, "node")
+        if pending is not None:
+
+
+            raise engine.ConfigError(
+                f"'{name}' was offboarded and is pending deletion (#{pending['id']}, due "
+                f"{pending['due_at'][:10]}). Recover it, delete it now (Pending deletion page, or "
+                f"`pending-deletions --delete-now {pending['id']}`), or use a different name.")
 
         try:
 
@@ -4730,8 +4739,477 @@ def cmd_extend(args) -> int:
 @dataclass
 class OffboardResult:
 
-    outcome: Literal["aborted_by_user", "incomplete", "offboarded"]
+    outcome: Literal["aborted_by_user", "incomplete", "offboarded", "pending_deletion"]
     detail: str | None = None
+
+    pending_deletion: dict | None = None
+
+
+DELETION_GRACE_DAYS = 7
+PENDING_DELETE_TAG_PREFIX = "lis-pending-delete:"
+PENDING_UNTAG_TAG_PREFIX = "lis-pending-untag:"
+PENDING_OF_TAG_PREFIX = "lis-pending-of:"
+_PENDING_TAG_PREFIXES = (PENDING_DELETE_TAG_PREFIX, PENDING_UNTAG_TAG_PREFIX, PENDING_OF_TAG_PREFIX)
+
+
+def deletion_grace_days() -> int:
+
+    raw = os.environ.get("LIS_DELETION_GRACE_DAYS", "").strip()
+    try:
+        return max(0, int(raw)) if raw else DELETION_GRACE_DAYS
+    except ValueError:
+        return DELETION_GRACE_DAYS
+
+
+def pending_marker_from_tags(tags: list[str] | None, name: str) -> str | None:
+
+    tags = tags or []
+    if f"{PENDING_OF_TAG_PREFIX}{name}" not in tags:
+        return None
+    for t in tags:
+        if t.startswith((PENDING_DELETE_TAG_PREFIX, PENDING_UNTAG_TAG_PREFIX)):
+            return t.split(":", 1)[1]
+    return None
+
+
+def _load_pending_resource(client, res: dict):
+    if res["type"] == "volume":
+        return client.load(Volume, res["id"])
+    if res["type"] == "ip":
+        return client.load(engine.ReservedIPAddress, res["id"])
+    return client.load(Instance, res["id"])
+
+
+def _set_pending_tags(client, res: dict, name: str, due: str | None) -> None:
+
+    try:
+        obj = engine.retry_transient(lambda: _load_pending_resource(client, res))
+    except ApiError as e:
+        if e.status == 404:
+            return
+        raise
+    current = list(getattr(obj, "tags", None) or [])
+    tags = [t for t in current if not t.startswith(_PENDING_TAG_PREFIXES)]
+    if due is not None:
+        prefix = PENDING_UNTAG_TAG_PREFIX if res.get("action") == "untag" else PENDING_DELETE_TAG_PREFIX
+        tags += [f"{prefix}{due[:10]}", f"{PENDING_OF_TAG_PREFIX}{name}"]
+    if sorted(tags) == sorted(current):
+        return
+    obj.tags = tags
+    engine.retry_transient(obj.save)
+    fresh = engine.retry_transient(lambda: _load_pending_resource(client, res))
+    if sorted(getattr(fresh, "tags", None) or []) != sorted(tags):
+        raise engine.TagVerificationError(
+            f"{res['type']} {res['id']}: pending-deletion tags didn't save.")
+
+
+def _pending_row_to_dict(row) -> dict:
+    keys = ("id", "name", "kind", "status", "created_at", "due_at", "resources", "bundle",
+            "detail", "updated_at")
+    entry = dict(zip(keys, row, strict=True))
+    entry["resources"] = json.loads(entry["resources"] or "[]")
+    entry["bundle"] = json.loads(entry["bundle"]) if entry["bundle"] else None
+    return entry
+
+
+_PENDING_COLUMNS = ("id, name, kind, status, created_at, due_at, resources, bundle, detail, "
+                    "updated_at")
+
+
+def list_pending_deletions(*, include_done: bool = False) -> list[dict]:
+    def _do():
+        conn = _connect()
+        try:
+            sql = f"SELECT {_PENDING_COLUMNS} FROM pending_deletions"
+            if not include_done:
+                sql += " WHERE status IN ('pending', 'failed')"
+            return conn.execute(sql + " ORDER BY due_at, id").fetchall()
+        finally:
+            conn.close()
+
+    return [_pending_row_to_dict(r) for r in _retry_db(_do)]
+
+
+def get_pending_deletion(entry_id: int) -> dict | None:
+    def _do():
+        conn = _connect()
+        try:
+            return conn.execute(f"SELECT {_PENDING_COLUMNS} FROM pending_deletions WHERE id = ?",
+                                (entry_id,)).fetchone()
+        finally:
+            conn.close()
+
+    row = _retry_db(_do)
+    return _pending_row_to_dict(row) if row else None
+
+
+def pending_deletion_for(name: str, kind: str | None = None) -> dict | None:
+
+    for entry in list_pending_deletions():
+        if entry["name"] == name and (kind is None or entry["kind"] == kind):
+            return entry
+    return None
+
+
+def _insert_pending_row(entry: dict) -> int:
+    def _do():
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO pending_deletions (name, kind, status, created_at, due_at, resources, "
+                "bundle, detail, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entry["name"], entry["kind"], entry.get("status", "pending"), entry["created_at"],
+                 entry["due_at"], json.dumps(entry.get("resources") or []),
+                 json.dumps(entry["bundle"]) if entry.get("bundle") is not None else None,
+                 entry.get("detail"), entry.get("updated_at") or entry["created_at"]))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    return _retry_db(_do)
+
+
+def _mirror_pending(entry: dict, on_warning: Callable[[str], None] | None = None) -> None:
+
+    if not osb.is_configured():
+        return
+    try:
+        if entry["status"] in ("pending", "failed"):
+            osb.upload_pending_deletion(entry["kind"], entry["name"], entry)
+        else:
+            osb.delete_pending_deletion(entry["kind"], entry["name"])
+    except Exception as e:
+        if on_warning is not None:
+            on_warning(f"WARNING: couldn't update the Object Storage copy of the pending deletion "
+                       f"of '{entry['name']}' ({e}); its tags still mark it.")
+
+
+def _update_pending(entry_id: int, **fields) -> dict | None:
+    fields["updated_at"] = datetime.now(UTC).isoformat()
+
+    def _do():
+        conn = _connect()
+        try:
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            conn.execute(f"UPDATE pending_deletions SET {sets} WHERE id = ?",
+                         (*[json.dumps(v) if k in ("resources", "bundle") else v
+                            for k, v in fields.items()], entry_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_db(_do)
+    entry = get_pending_deletion(entry_id)
+    if entry is not None:
+        _mirror_pending(entry)
+    return entry
+
+
+def schedule_pending_deletion(
+    client, name: str, kind: str, resources: list[dict], *, bundle: dict | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> dict:
+
+    now = datetime.now(UTC)
+    due = (now + timedelta(days=deletion_grace_days())).isoformat()
+    for res in resources:
+        _set_pending_tags(client, res, name, due)
+    entry = {"name": name, "kind": kind, "status": "pending", "created_at": now.isoformat(),
+             "due_at": due, "resources": resources, "bundle": bundle}
+    entry_id = _insert_pending_row(entry)
+    entry = get_pending_deletion(entry_id) or {**entry, "id": entry_id}
+    _mirror_pending(entry, on_warning)
+    if on_progress is not None:
+        what = ", ".join(f"{r['type']} {r['id']}" for r in resources) or "nothing"
+        on_progress(f"  pending deletion #{entry_id}: {what} -- carried out automatically on "
+                    f"{due[:10]} unless recovered or deleted sooner")
+    record_activity(f"{kind.replace('_', ' ')} '{name}' pending deletion until {due[:10]} "
+                    f"(#{entry_id})", level="warning", source="system", instance_name=name,
+                    action="pending-deletion")
+    return entry
+
+
+def _carry_out_pending_resource(client, res: dict, name: str) -> str:
+
+    try:
+        obj = engine.retry_transient(lambda: _load_pending_resource(client, res))
+    except ApiError as e:
+        if e.status == 404:
+            return "already gone"
+        raise
+    tags = list(getattr(obj, "tags", None) or [])
+    if f"{PENDING_OF_TAG_PREFIX}{name}" not in tags:
+        return "kept: no longer marked pending deletion"
+    owners = set(engine.names_from_tags(tags))
+    if owners - {name}:
+        return f"kept: now belongs to {', '.join(sorted(owners))}"
+    if res.get("action") == "untag":
+        engine.untag_managed_resources(client, name, os_volume_id=res["id"] if res.get("role") == "os" else None,
+                                       data_volume_ids=[res["id"]] if res.get("role") == "data" else [])
+        if res.get("role") == "os":
+            _strip_recovery_metadata_tags(client, res["id"])
+        _set_pending_tags(client, res, name, None)
+        return "kept, untagged"
+    if res["type"] == "volume" and getattr(obj, "linode_id", None):
+        return f"kept: attached to instance {obj.linode_id}"
+    if res["type"] == "ip" and getattr(obj, "linode_id", None):
+        return f"kept: assigned to instance {obj.linode_id}"
+    engine.retry_transient_or_already_done(
+        obj.delete, lambda: engine._resource_confirmed_gone(client, obj))
+    if res["type"] == "ip":
+        with contextlib_suppress(Exception):
+            engine.reset_known_host(res["id"])
+    return "deleted"
+
+
+def delete_pending_now(client, entry_id: int, *, actor: str | None = None,
+                       on_progress: Callable[[str], None] | None = None,
+                       on_warning: Callable[[str], None] | None = None) -> dict:
+
+    entry = get_pending_deletion(entry_id)
+    if entry is None:
+        raise engine.ConfigError(f"no pending deletion #{entry_id}.")
+    if entry["status"] not in ("pending", "failed"):
+        raise engine.ConfigError(f"pending deletion #{entry_id} is already {entry['status']}.")
+    name = entry["name"]
+    if entry["kind"] == "node" and name in load_registry():
+        raise engine.ConfigError(f"a node named '{name}' is onboarded again -- this pending "
+                                 "deletion can only be recovered or left to expire after it's "
+                                 "offboarded.")
+    results, failed = [], False
+    with _instance_lock(name):
+        if entry["kind"] == "migration_backup":
+            backup = get_migration_backup(name)
+            if backup is None:
+                results.append("backup record already gone")
+            else:
+                problems = engine.delete_migration_backup_resources(
+                    client, backup["record"], name, on_progress=on_progress)
+                if problems:
+                    failed = True
+                    results.extend(problems)
+                else:
+                    results.append("backup instance and cloned volumes deleted")
+                    _delete_migration_backup_row(name)
+                    _sync_migration_backup_record(name, on_warning)
+        else:
+            order = {"volume": 0, "ip": 1}
+            for res in sorted(entry["resources"], key=lambda r: order.get(r["type"], 9)):
+                try:
+                    outcome = _carry_out_pending_resource(client, res, name)
+                except Exception as e:
+                    outcome, failed = f"failed: {e}", True
+                res["outcome"] = outcome
+                results.append(f"{res['type']} {res['id']}: {outcome}")
+                if on_progress is not None:
+                    on_progress(f"  {res['type']} {res['id']}: {outcome}")
+            if not failed:
+                with contextlib_suppress(Exception):
+                    if osb.is_configured():
+                        osb.delete_instance_backup(name)
+    status = "failed" if failed else "deleted"
+    updated = _update_pending(entry_id, status=status, resources=entry["resources"],
+                              detail="; ".join(results))
+    record_activity(f"pending deletion #{entry_id} ({name}): {status} -- " + "; ".join(results),
+                    level="warning" if failed else "info", source="system", instance_name=name,
+                    action="pending-deletion", actor=actor)
+    return updated or entry
+
+
+def process_due_deletions(client, *, now: datetime | None = None,
+                          on_warning: Callable[[str], None] | None = None) -> list[int]:
+
+    now = now or datetime.now(UTC)
+    handled = []
+    for entry in list_pending_deletions():
+        if datetime.fromisoformat(entry["due_at"]) > now:
+            continue
+        try:
+            done = delete_pending_now(client, entry["id"], on_warning=on_warning)
+            handled.append(entry["id"])
+            if done["status"] == "failed" and on_warning is not None:
+                on_warning(f"WARNING: pending deletion #{entry['id']} ({entry['name']}) didn't "
+                           f"complete: {done['detail']} -- retried on the next pass.")
+        except Exception as e:
+            if on_warning is not None:
+                on_warning(f"WARNING: pending deletion #{entry['id']} ({entry['name']}) "
+                           f"failed: {e}")
+    return handled
+
+
+def recover_pending(client, entry_id: int, *, actor: str | None = None,
+                    on_progress: Callable[[str], None] | None = None,
+                    on_warning: Callable[[str], None] | None = None) -> dict:
+
+    entry = get_pending_deletion(entry_id)
+    if entry is None:
+        raise engine.ConfigError(f"no pending deletion #{entry_id}.")
+    if entry["status"] not in ("pending", "failed"):
+        raise engine.ConfigError(f"pending deletion #{entry_id} is {entry['status']} -- only an "
+                                 "open one can be recovered.")
+    name = entry["name"]
+    for res in entry["resources"]:
+        try:
+            engine.retry_transient(lambda res=res: _load_pending_resource(client, res))
+        except ApiError as e:
+            if e.status == 404:
+                raise engine.ConfigError(f"{res['type']} {res['id']} no longer exists, so '{name}' "
+                                         "can't be recovered.") from e
+            raise
+    if entry["kind"] == "migration_backup":
+        for res in entry["resources"]:
+            _set_pending_tags(client, res, name, None)
+    else:
+        bundle = entry.get("bundle") or {}
+        record = bundle.get("record")
+        if not record:
+            raise engine.ConfigError("this pending deletion has no saved record to recover from.")
+        problems: list[str] = []
+        with _instance_lock(name):
+            if name in load_registry():
+                raise engine.ConfigError(f"a node named '{name}' is onboarded again -- offboard or "
+                                         "deregister it before recovering this one.")
+            record = {**record, "current_status": "stopped", "current_linode_id": None,
+                      "transitioning": False, "manual_override_expires_at": None,
+                      "group_id": None}
+            _save_one_record(name, record)
+            for res in entry["resources"]:
+                try:
+                    _set_pending_tags(client, res, name, None)
+                except Exception as e:
+                    problems.append(f"pending tag on {res['type']} {res['id']}: {e}")
+        if on_progress is not None:
+            on_progress(f"  '{name}' is back in the registry (stopped)")
+        steps: list[tuple[str, Callable[[], object]]] = []
+        schedule = bundle.get("schedule")
+        group_name = bundle.get("group")
+        if schedule:
+            steps.append(("schedule", lambda: save_instance_schedule(
+                client, name, schedule["timezone"], schedule["rules"],
+                schedule.get("enabled", True), on_warning=on_warning)))
+        if group_name:
+            if get_schedule_group(group_name) is not None:
+                steps.append(("group", lambda: assign_instance_to_group(
+                    client, name, group_name, on_warning=on_warning)))
+            else:
+                problems.append(f"group '{group_name}' no longer exists")
+        if bundle.get("hooks"):
+            steps.append(("hooks", lambda: set_instance_hooks(
+                name, bundle["hooks"], client=client, actor=actor, on_warning=on_warning)))
+        if bundle.get("schedule_mode") == "manual":
+            steps.append(("manual-only", lambda: set_schedule_mode(client, name, "manual")))
+        if bundle.get("account_holidays"):
+            steps.append(("holiday setting", lambda: set_instance_account_holidays(
+                client, name, bundle["account_holidays"])))
+        for label, step in steps:
+            try:
+                step()
+                if on_progress is not None:
+                    on_progress(f"  {label} restored")
+            except Exception as e:
+                problems.append(f"{label}: {e}")
+        with contextlib_suppress(Exception):
+            osb.sync_object_storage_backup(
+                name, _backup_payload(name, load_registry().get(name) or record),
+                on_warning=on_warning)
+        if problems and on_warning is not None:
+            on_warning("WARNING: recovered, but: " + "; ".join(problems))
+    updated = _update_pending(entry_id, status="recovered")
+    record_activity(f"pending deletion #{entry_id} ({name}) cancelled -- "
+                    f"{entry['kind'].replace('_', ' ')} recovered", level="warning",
+                    source="system", instance_name=name, action="pending-deletion", actor=actor)
+    return updated or entry
+
+
+def _node_recovery_bundle(name: str, record: dict, *, delete_volumes: bool) -> dict:
+    group = _group_row_by_id(record["group_id"]) if record.get("group_id") else None
+    bundle: dict = {"record": record, "delete_volumes": delete_volumes,
+                    "group": group["name"] if group else None, "schedule": None, "hooks": None,
+                    "schedule_mode": None, "account_holidays": None}
+    with contextlib_suppress(Exception):
+        bundle["schedule"] = get_instance_schedule(name)
+    with contextlib_suppress(Exception):
+        bundle["hooks"] = get_instance_hooks(name) or None
+    with contextlib_suppress(Exception):
+        bundle["schedule_mode"] = get_schedule_mode(name)
+    with contextlib_suppress(Exception):
+        bundle["account_holidays"] = get_instance_account_holidays(name)
+    return bundle
+
+
+def _node_pending_resources(record: dict, *, delete_volumes: bool) -> list[dict]:
+    action = "delete" if delete_volumes else "untag"
+    resources = []
+    if record.get("os_volume_id"):
+        resources.append({"type": "volume", "id": record["os_volume_id"], "role": "os",
+                          "action": action})
+    for dv in record.get("data_volumes") or []:
+        resources.append({"type": "volume", "id": dv["volume_id"], "role": "data",
+                          "action": action})
+    if record.get("reserved_ip"):
+        resources.append({"type": "ip", "id": record["reserved_ip"], "role": "ip",
+                          "action": "delete"})
+    return resources
+
+
+def offboard_to_pending(client, name: str, record: dict, *, delete_volumes: bool,
+                        on_progress: Callable[[str], None] | None = None,
+                        on_warning: Callable[[str], None] | None = None) -> dict:
+
+    bundle = _node_recovery_bundle(name, record, delete_volumes=delete_volumes)
+    entry = schedule_pending_deletion(client, name, "node",
+                                      _node_pending_resources(record, delete_volumes=delete_volumes),
+                                      bundle=bundle, on_progress=on_progress, on_warning=on_warning)
+    with contextlib_suppress(Exception):
+        osb.sync_object_storage_backup(name, _backup_payload(name, record), on_warning=on_warning)
+    _delete_one_record(name)
+    return entry
+
+
+def restore_pending_deletions_from_object_storage(
+    on_progress: Callable[[str], None] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> set[str]:
+
+    keys = osb.list_pending_deletions() if osb.is_configured() else []
+    if keys is None and on_warning is not None:
+        on_warning("WARNING: couldn't list pending deletions in Object Storage; nodes pending "
+                   "deletion are still recognised from their tags.")
+    for kind, name in keys or []:
+        if pending_deletion_for(name, kind) is not None:
+            continue
+        record = osb.download_pending_deletion(kind, name)
+        if not record or record.get("status") not in ("pending", "failed"):
+            continue
+        _insert_pending_row(record)
+        if on_progress is not None:
+            on_progress(f"  pending deletion of {kind.replace('_', ' ')} '{name}' restored "
+                        f"(due {record['due_at'][:10]})")
+    return {e["name"] for e in list_pending_deletions() if e["kind"] == "node"}
+
+
+def _rebuilt_node_to_pending(client, name: str, record: dict, due: str) -> dict:
+
+    bundle = _node_recovery_bundle(name, record, delete_volumes=False)
+    resources = _node_pending_resources(record, delete_volumes=False)
+    for res in resources:
+        with contextlib_suppress(Exception):
+            obj = engine.retry_transient(lambda res=res: _load_pending_resource(client, res))
+            tags = getattr(obj, "tags", None) or []
+            if any(t.startswith(PENDING_DELETE_TAG_PREFIX) for t in tags):
+                res["action"] = "delete"
+    bundle["delete_volumes"] = any(r["action"] == "delete" for r in resources
+                                   if r["type"] == "volume")
+    now = datetime.now(UTC).isoformat()
+    entry_id = _insert_pending_row({"name": name, "kind": "node", "status": "pending",
+                                    "created_at": now, "due_at": f"{due}T00:00:00+00:00",
+                                    "resources": resources, "bundle": bundle})
+    _delete_one_record(name)
+    entry = get_pending_deletion(entry_id) or {}
+    _mirror_pending(entry)
+    return entry
 
 
 def _is_recovery_metadata_tag(tag: str) -> bool:
@@ -4763,6 +5241,7 @@ def _strip_recovery_metadata_tags(client, os_volume_id: int | None) -> None:
 def offboard_instance(
     client, name: str, *,
     delete_volumes: bool = False,
+    grace: bool = False,
     confirm: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_warning: Callable[[str], None] | None = None,
@@ -4782,6 +5261,33 @@ def offboard_instance(
         reserved_ip = record.get("reserved_ip")
         os_volume_id = record.get("os_volume_id")
         data_volume_ids = [dv["volume_id"] for dv in record.get("data_volumes", [])]
+
+        grace_days = deletion_grace_days() if grace else 0
+        if grace_days > 0:
+            if on_progress is not None:
+                on_progress(f"Offboarding '{name}' removes it from management now. Nothing is "
+                            f"deleted yet: after {grace_days} day(s) the following happens "
+                            "automatically, unless you recover it or delete it sooner from "
+                            "Pending deletion:")
+                if reserved_ip:
+                    on_progress(f"  - reserved IP {reserved_ip} is released")
+                if delete_volumes:
+                    on_progress(f"  - the OS volume ({os_volume_id}) and {len(data_volume_ids)} "
+                                f"data volume(s) {data_volume_ids} are permanently deleted")
+                else:
+                    on_progress(f"  - the OS volume ({os_volume_id}) and data volume(s) are kept, "
+                                "with this node's tags removed")
+            if confirm is not None and not confirm():
+                return OffboardResult(outcome="aborted_by_user")
+            try:
+                entry = offboard_to_pending(client, name, record, delete_volumes=delete_volumes,
+                                            on_progress=on_progress, on_warning=on_warning)
+            except (ApiError, requests.exceptions.RequestException, engine.ConfigError) as e:
+                return OffboardResult(
+                    outcome="incomplete",
+                    detail=f"Could not mark '{name}' pending deletion ({e}). Nothing was deleted "
+                    f"and '{name}' is still onboarded. Re-run `offboard --name {name}` to retry.")
+            return OffboardResult(outcome="pending_deletion", pending_deletion=entry)
 
         if on_progress is not None:
             on_progress(f"Offboarding '{name}' will permanently:")
@@ -5015,6 +5521,7 @@ def cmd_offboard(client, args) -> int:
     try:
         result = offboard_instance(
             client, args.name, delete_volumes=args.delete_volumes,
+            grace=not getattr(args, "now", False),
             confirm=None if args.yes else _confirm,
             on_progress=print, on_warning=_print_to_stderr,
         )
@@ -5030,6 +5537,13 @@ def cmd_offboard(client, args) -> int:
     if result.outcome == "incomplete":
         print(f"  {result.detail}", file=sys.stderr)
         return 1
+    if result.outcome == "pending_deletion":
+        entry = result.pending_deletion or {}
+        print(f"'{args.name}' is offboarded and pending deletion (#{entry.get('id')}). Nothing "
+              f"has been deleted yet: it happens automatically on {str(entry.get('due_at'))[:10]}."
+              f"\n  Recover it:     pending-deletions --recover {entry.get('id')}"
+              f"\n  Delete it now:  pending-deletions --delete-now {entry.get('id')}")
+        return 0
     print(f"'{args.name}' fully offboarded.")
     return 0
 
@@ -6677,6 +7191,11 @@ def backup_full_system(
                   else EnvBackupResult("not_configured"))
     if env_result.outcome == "failed":
         result.ssh_key_problems.append(f"encrypted settings backup: {env_result.detail}")
+    if other is None and result.object_storage_configured:
+        try:
+            backup_release_copy(on_progress=on_progress)
+        except Exception as e:
+            result.ssh_key_problems.append(f"release copy: {e}")
     for problem in key_result.problems:
         if on_warning is not None:
             on_warning(f"  WARNING: deployment SSH key: {problem}")
@@ -6950,7 +7469,7 @@ def acquire_or_renew_lease(*, now: datetime | None = None, take_over: bool = Fal
     try:
         lease = read_lease()
     except Exception as e:
-        return LeaseStatus(True, "active", detail=f"couldn't read the lease ({e}); continuing")
+        return _lease_unreachable(now, take_over, f"couldn't read the lease ({e})")
     mine = lease is not None and lease.get("id") == me
     if lease is not None and not mine and _lease_age_seconds(lease, now) < LEASE_TTL_SECONDS and not take_over:
         status = LeaseStatus(False, "standby", holder=lease,
@@ -6972,14 +7491,46 @@ def acquire_or_renew_lease(*, now: datetime | None = None, take_over: bool = Fal
                 _record_lease_state(status, now)
                 return status
     except Exception as e:
-        return LeaseStatus(True, "active", detail=f"couldn't write the lease ({e}); continuing")
+        return _lease_unreachable(now, take_over, f"couldn't write the lease ({e})")
     status = LeaseStatus(True, "active", holder=record)
     _record_lease_state(status, now)
+    _mark_lease_held(now)
     if lease is not None and not mine:
         record_activity(
             f"this scheduler took the lease over from {lease.get('host')}"
             f"{' (explicit take-over)' if take_over else ' (its lease had expired)'}",
             level="warning", source="scheduler", action="lease")
+    return status
+
+
+def _lease_held_path() -> Path:
+    return REGISTRY_PATH.parent / "scheduler-lease-held"
+
+
+def _mark_lease_held(now: datetime) -> None:
+    with contextlib_suppress(OSError):
+        path = _lease_held_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(now.isoformat() + "\n")
+
+
+def _last_held_lease(now: datetime) -> datetime | None:
+    try:
+        return datetime.fromisoformat(_lease_held_path().read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _lease_unreachable(now: datetime, take_over: bool, why: str) -> LeaseStatus:
+
+    held = _last_held_lease(now)
+    if take_over or (held is not None and (now - held).total_seconds() < 2 * LEASE_TTL_SECONDS):
+        if take_over:
+            _mark_lease_held(now)
+        return LeaseStatus(True, "active", detail=f"{why}; continuing as the active scheduler")
+    status = LeaseStatus(False, "standby", detail=f"{why}; this host wasn't the active scheduler, "
+                         "so it waits (use `scheduler-lease --take-over` if the old one is gone)")
+    _record_lease_state(status, now)
     return status
 
 
@@ -7010,6 +7561,41 @@ def lease_state() -> dict | None:
     if row is None:
         return None
     return {"role": row[0], "holder_host": row[1], "holder_renewed_at": row[2], "updated_at": row[3]}
+
+
+STANDBY_ALLOWED_COMMANDS = frozenset({
+    "list", "status", "history", "schedule-show", "group-show", "group-list", "hooks-show",
+    "holiday-list", "backup-list", "api-token-list", "api-token-scopes", "alerts-check",
+    "alerts-test", "scheduler-lease", "backup-verify", "backup", "backup-config", "restore",
+    "ssh-key-backup", "ssh-key-restore", "env-backup", "env-restore", "env-backup-keygen",
+    "console-session-delete", "poll", "serve-api", "host-watchdog", "recovery-drill-check",
+    "release-backup", "restore-item",
+})
+
+
+DRILL_ALLOWED_COMMANDS = frozenset({
+    "list", "status", "history", "schedule-show", "group-show", "group-list", "hooks-show",
+    "holiday-list", "backup-list", "api-token-list", "api-token-scopes", "restore",
+    "ssh-key-restore", "env-restore", "recovery-drill-check", "scheduler-lease",
+})
+
+
+def standby_refusal(command: str, *, read_only: bool = False) -> str | None:
+
+    if os.environ.get("LIS_RECOVERY_DRILL", "").strip() == "1" and not (
+            read_only or command in DRILL_ALLOWED_COMMANDS):
+        return ("this host is running a recovery drill: it only restores and checks, and never "
+                "changes nodes, tags, the lease or the bucket.")
+    if read_only or command in STANDBY_ALLOWED_COMMANDS:
+        return None
+    if os.environ.get("LIS_ALLOW_STANDBY_CHANGES", "").strip() == "1":
+        return None
+    lease = another_scheduler_active()
+    if lease is None:
+        return None
+    return (f"this host is a standby: {lease.get('host')} is the active scheduler (lease renewed "
+            f"{lease.get('renewed_at')}). Make changes there -- two hosts changing the same nodes "
+            "can undo each other. If that host is gone, run `scheduler-lease --take-over` here first.")
 
 
 def another_scheduler_active(now: datetime | None = None) -> dict | None:
@@ -7215,7 +7801,9 @@ RUNTIME_RELOADABLE_KEYS = (
     "LIS_ALERT_WEBHOOK_URL", "LIS_ALERT_EMAIL_TO", "LIS_ALERT_SMTP_HOST", "LIS_ALERT_SMTP_PORT",
     "LIS_ALERT_SMTP_SECURITY", "LIS_ALERT_SMTP_USER", "LIS_ALERT_SMTP_PASSWORD",
     "LIS_ALERT_EMAIL_FROM", "LIS_ENV_BACKUP_RECIPIENTS", "LIS_HEARTBEAT_URL",
-    "LIS_BACKUP_KEEP_ALL_HOURS", "LIS_BACKUP_KEEP_DAILY_DAYS",
+    "LIS_BACKUP_KEEP_ALL_HOURS", "LIS_BACKUP_KEEP_DAILY_DAYS", "LIS_DELETION_GRACE_DAYS",
+    "LINODE_API_TOKEN", "LINODE_OAUTH_CLIENT_SECRET", "LINODE_SSH_PREVIOUS_KEY_PATH",
+    "LIS_RECOVERY_DRILL_DAYS",
 )
 
 
@@ -7233,12 +7821,18 @@ def reload_object_storage_settings_if_changed() -> bool:
         return False
     _env_mtime = mtime
     values = dotenv_values(ENV_PATH)
+    old_token = os.environ.get("LINODE_API_TOKEN")
     for key in tuple(osb.SETTING_KEYS) + RUNTIME_RELOADABLE_KEYS:
         value = values.get(key)
         if value:
             os.environ[key] = value
+        elif key == "LINODE_API_TOKEN":
+            continue
         else:
             os.environ.pop(key, None)
+    new_token = os.environ.get("LINODE_API_TOKEN")
+    if new_token and new_token != old_token:
+        engine.set_token_on_clients(new_token)
     osb.reset_client()
     return True
 
@@ -7325,6 +7919,11 @@ def configure_system_backup(bucket: str, endpoint: str, access_key: str, secret_
                          "LINODE_OBJ_STORAGE_ENDPOINT": endpoint.strip(),
                          "LINODE_OBJ_STORAGE_ACCESS_KEY": access_key.strip(),
                          "LINODE_OBJ_STORAGE_SECRET_KEY": secret_key.strip()})
+
+
+    with contextlib_suppress(Exception):
+        osb.reset_client()
+        osb.enable_bucket_protection()
 
 
 def disable_system_backup_object_storage() -> None:
@@ -7660,6 +8259,114 @@ def deployment_key_status() -> dict:
     }
 
 
+APP_DIR = Path(__file__).resolve().parent
+RELEASE_OBJECT_LATEST = "release/latest.tar.gz"
+_RELEASE_EXCLUDE = {".venv", "state", "keys", "backups", ".env", "node_modules", "__pycache__",
+                    ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "test-results", "wheels"}
+
+
+def release_version() -> str:
+    try:
+        value = (APP_DIR / "VERSION").read_text().strip()
+        return value or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _release_files() -> list[Path]:
+    files = []
+    for path in sorted(APP_DIR.rglob("*")):
+        rel = path.relative_to(APP_DIR)
+        if any(part in _RELEASE_EXCLUDE for part in rel.parts) or not path.is_file():
+            continue
+        if rel.name.startswith("test_") or rel.name == "conftest.py":
+            continue
+        files.append(path)
+    return files
+
+
+def _release_fingerprint(files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(APP_DIR)).encode())
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def build_release_archive(dest: Path, *, with_wheels: bool = True) -> dict:
+
+    import tarfile
+    files = _release_files()
+    with tempfile.TemporaryDirectory() as tmp:
+        wheel_dir = Path(tmp) / "wheels"
+        wheels: list[Path] = []
+        lock = APP_DIR / "requirements.lock"
+        if with_wheels and lock.is_file():
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "download", "--quiet", "--require-hashes",
+                 "-r", str(lock), "-d", str(wheel_dir)],
+                capture_output=True, text=True, timeout=900, check=False)
+            if result.returncode != 0:
+                raise engine.ConfigError(f"couldn't download the dependency wheels: "
+                                         f"{result.stderr.strip()[-400:]}")
+            wheels = sorted(wheel_dir.iterdir())
+        with tarfile.open(dest, "w:gz") as tar:
+            for path in files:
+                tar.add(path, arcname=f"linode-instance-scheduler/{path.relative_to(APP_DIR)}")
+            for wheel in wheels:
+                tar.add(wheel, arcname=f"linode-instance-scheduler/wheels/{wheel.name}")
+    return {"version": release_version(), "files": len(files), "wheels": len(wheels),
+            "bytes": dest.stat().st_size, "fingerprint": _release_fingerprint(files)}
+
+
+def _release_state_path() -> Path:
+    return REGISTRY_PATH.parent / "release-backup.json"
+
+
+def release_backup_status() -> dict:
+    try:
+        return json.loads(_release_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def backup_release_copy(*, force: bool = False,
+                        on_progress: Callable[[str], None] | None = None) -> dict | None:
+
+    if not osb.is_configured():
+        return None
+    fingerprint = _release_fingerprint(_release_files())
+    state = release_backup_status()
+
+    if (not force and state.get("fingerprint") == fingerprint and not state.get("last_error")
+            and osb.deployment_file_exists(RELEASE_OBJECT_LATEST) is not False):
+        return None
+    now = datetime.now(UTC).isoformat()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "release.tar.gz"
+            info = build_release_archive(archive)
+            data = archive.read_bytes()
+            version = re.sub(r"[^A-Za-z0-9._-]", "_", info["version"])
+            osb.upload_deployment_file(f"release/{version}.tar.gz", data)
+            osb.upload_deployment_file(RELEASE_OBJECT_LATEST, data)
+    except Exception as e:
+        state.update(last_error=str(e)[:500], last_attempt_at=now)
+        _release_state_path().parent.mkdir(parents=True, exist_ok=True)
+        _release_state_path().write_text(json.dumps(state))
+        raise
+    state = {**info, "fingerprint": fingerprint, "uploaded_at": now, "last_error": None}
+    _release_state_path().parent.mkdir(parents=True, exist_ok=True)
+    _release_state_path().write_text(json.dumps(state))
+    record_activity(f"release copy {info['version']} saved to Object Storage "
+                    f"({info['bytes'] // 1024} KiB, {info['wheels']} dependency wheels)",
+                    source="system", action="release-backup")
+    if on_progress is not None:
+        on_progress(f"  release copy {info['version']} uploaded ({info['bytes'] // 1024} KiB, "
+                    f"{info['wheels']} wheels)")
+    return state
+
+
 def protect_deployment_ssh_key(
     client, key_path: Path, *, passphrase: str | None = None,
     hostname: str | None = None,
@@ -7773,6 +8480,601 @@ def protect_deployment_ssh_key(
                 f"could not keep the passphrase's recovery copy in the Linode account (a private "
                 f"StackScript; the API token needs StackScripts read/write): {e}")
     return result
+
+
+RECOVERY_DRILL_TAG = "lis-recovery-drill"
+RECOVERY_DRILL_OBJECT_NAME = "recovery-drill.json"
+
+
+def recovery_drill_check(client) -> dict:
+
+    report: dict = {"checked_at": datetime.now(UTC).isoformat(), "version": release_version(),
+                    "ok": True, "checks": [], "problems": []}
+
+    def ok(msg: str) -> None:
+        report["checks"].append(msg)
+
+    def bad(msg: str) -> None:
+        report["problems"].append(msg)
+        report["ok"] = False
+
+    registry = load_registry()
+    groups = list_schedule_groups()
+    ok(f"database restored: {len(registry)} node(s), {len(groups)} group(s)")
+    key_path = deployment_ssh_key_path()
+    row = None
+    with contextlib_suppress(Exception):
+        row = _deployment_secret_row()
+    if not key_path.is_file():
+        bad(f"no deployment SSH key at {key_path}")
+    else:
+        public = _public_key_text(key_path, key_path.read_bytes())
+        if row is not None and row[2] and public and not _same_public_key(row[2], public):
+            bad("the restored SSH key isn't the one the database records")
+        else:
+            ok("deployment SSH key restored and matches the database")
+    try:
+        engine.auth_check(client)
+        ok("Linode API token works")
+    except Exception as e:
+        bad(f"Linode API token: {e}")
+        return report
+    reachable = 0
+    for name, record in registry.items():
+        for vid in [record.get("os_volume_id")] + [d["volume_id"] for d in record.get("data_volumes") or []]:
+            if not vid:
+                continue
+            try:
+                engine.retry_transient(lambda vid=vid: client.load(Volume, vid))
+            except Exception as e:
+                bad(f"{name}: volume {vid}: {e}")
+        if record.get("reserved_ip"):
+            try:
+                engine.retry_transient(lambda r=record: client.load(engine.ReservedIPAddress, r["reserved_ip"]))
+            except Exception as e:
+                bad(f"{name}: reserved IP {record['reserved_ip']}: {e}")
+        if record.get("current_status") == "running":
+            try:
+                engine.ssh_run(_ssh_target(record, name), str(key_path), "true", retries=1,
+                               timeout_s=15)
+                reachable += 1
+            except Exception as e:
+                bad(f"{name}: running but not reachable with the restored key and host keys: "
+                    f"{str(e)[:200]}")
+    ok(f"every node's volumes and reserved IP exist; {reachable} running node(s) reachable over SSH "
+       "with the restored key")
+    return report
+
+
+def cmd_recovery_drill_check(client, args) -> int:
+    report = recovery_drill_check(client)
+    text = json.dumps(report, indent=2)
+    if args.report:
+        Path(args.report).write_text(text)
+    print(text)
+    return 0 if report["ok"] else 1
+
+
+def _drill_state_path() -> Path:
+    return REGISTRY_PATH.parent / "recovery-drill.json"
+
+
+def recovery_drill_status() -> dict:
+    try:
+        return json.loads(_drill_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def drill_interval_days() -> int:
+    raw = os.environ.get("LIS_RECOVERY_DRILL_DAYS", "").strip()
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _record_drill(result: dict) -> None:
+    _drill_state_path().parent.mkdir(parents=True, exist_ok=True)
+    _drill_state_path().write_text(json.dumps(result))
+    with contextlib_suppress(Exception):
+        if osb.is_configured():
+            osb.upload_deployment_file(RECOVERY_DRILL_OBJECT_NAME, json.dumps(result).encode())
+
+
+def _scp(key_path: Path, src: Path, host: str, dest: str) -> None:
+    subprocess.run(["scp", "-q", *engine.ssh_identity_args(key_path), "-o", "BatchMode=yes",
+                    "-o", f"UserKnownHostsFile={engine.BASE_DIR / 'state' / 'known_hosts'}",
+                    "-o", "StrictHostKeyChecking=yes", str(src), f"root@{host}:{dest}"],
+                   check=True, capture_output=True, timeout=600)
+
+
+def run_recovery_drill(client, *, region: str | None = None, keep_vm: bool = False,
+                       on_progress: Callable[[str], None] | None = None) -> dict:
+
+    say = on_progress or (lambda _m: None)
+    started = datetime.now(UTC)
+    result: dict = {"started_at": started.isoformat(), "ok": False, "problems": []}
+    if not osb.is_configured():
+        raise engine.ConfigError("a recovery drill needs Object Storage (the snapshot and the "
+                                 "release copy come from the bucket).")
+    key_path = deployment_ssh_key_path()
+    public = _public_key_text(key_path, key_path.read_bytes()) if key_path.is_file() else None
+    if not public:
+        raise engine.ConfigError(f"no deployment SSH key at {key_path}.")
+
+    for inst in engine.retry_transient(lambda: list(client.linode.instances())):
+        if RECOVERY_DRILL_TAG in (inst.tags or []):
+            with contextlib_suppress(Exception):
+                engine.retry_transient(inst.delete)
+    backup_release_copy()
+    if region is None:
+        host = None
+        with contextlib_suppress(Exception):
+            host = scheduler_instance(client)
+        region = (str(host.region.id) if host is not None and host.region else None) or next(
+            (r.get("region") for r in load_registry().values() if r.get("region")), None)
+    if not region:
+        raise engine.ConfigError("couldn't tell which region to use -- pass --region.")
+    instance = None
+    try:
+        label = f"lis-drill-{started:%Y%m%d%H%M}"
+        say(f"Creating a throwaway VM ({label}, {region})")
+        instance, _ = engine.retry_transient(lambda: client.linode.instance_create(
+            "g6-nanode-1", region, image="linode/ubuntu24.04", label=label,
+            root_pass=secrets.token_urlsafe(24), authorized_keys=[public],
+            tags=[RECOVERY_DRILL_TAG]))
+        result["vm_id"] = instance.id
+        engine.poll_until_status(lambda: client.load(Instance, instance.id), ("running",),
+                                 timeout_s=600)
+        ip = client.load(Instance, instance.id).ipv4[0]
+        engine.ssh_run(ip, str(key_path), "cloud-init status --wait >/dev/null 2>&1; true",
+                       trust_new=True, retries=30, timeout_s=600)
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "release.tar.gz"
+            data = osb.download_deployment_file(RELEASE_OBJECT_LATEST)
+            if data is None:
+                raise engine.ConfigError("no release copy in the bucket")
+            archive.write_bytes(data)
+            env = Path(tmp) / "drill.env"
+            lines = [f"{k}={os.environ[k]}" for k in
+                     ("LINODE_API_TOKEN", *osb.SETTING_KEYS, SSH_KEY_PASSPHRASE_ENV)
+                     if os.environ.get(k)]
+            env.write_text("\n".join(lines + ["LIS_RECOVERY_DRILL=1"]) + "\n")
+            env.chmod(0o600)
+            say("Copying the release copy from the bucket to the VM")
+            _scp(key_path, archive, ip, "/root/release.tar.gz")
+            _scp(key_path, env, ip, "/root/drill.env")
+        say("Running install.sh recover --drill on the VM (about 5-10 minutes)")
+        out = engine.ssh_run(
+            ip, str(key_path),
+            "set -e; chmod 600 /root/drill.env; cd /root && tar xzf release.tar.gz && "
+            "cd linode-instance-scheduler && ./install.sh recover --drill --env-file /root/drill.env "
+            "--no-api > /root/drill.log 2>&1; rc=$?; cat /tmp/recovery-drill-report.json; exit $rc",
+            retries=1, timeout_s=1800)
+        report = json.loads(out[out.index("{"):]) if "{" in out else {}
+        result["report"] = report
+        result["ok"] = bool(report.get("ok"))
+        result["problems"] = report.get("problems", [])
+    except Exception as e:
+        result["problems"].append(str(e)[:500])
+        if instance is not None:
+            with contextlib_suppress(Exception):
+                result["log_tail"] = engine.ssh_run(
+                    client.load(Instance, instance.id).ipv4[0], str(key_path),
+                    "tail -40 /root/drill.log", retries=1)[-4000:]
+    finally:
+        if instance is not None and not keep_vm:
+            with contextlib_suppress(Exception):
+                engine.retry_transient(instance.delete)
+                result["vm_deleted"] = True
+            with contextlib_suppress(Exception):
+                engine.reset_known_host(client.load(Instance, instance.id).ipv4[0])
+    result["finished_at"] = datetime.now(UTC).isoformat()
+    _record_drill(result)
+    record_activity(f"recovery drill {'passed' if result['ok'] else 'FAILED'}"
+                    + ("" if result["ok"] else ": " + "; ".join(result["problems"])[:400]),
+                    level="info" if result["ok"] else "error", source="system",
+                    action="recovery-drill")
+    return result
+
+
+def cmd_recovery_drill(client, args) -> int:
+    try:
+        result = run_recovery_drill(client, region=args.region, keep_vm=args.keep_vm,
+                                    on_progress=print)
+    except engine.ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    if result["ok"]:
+        print("Recovery drill passed: " + "; ".join(result.get("report", {}).get("checks", [])))
+        return 0
+    print("Recovery drill FAILED: " + "; ".join(result["problems"]), file=sys.stderr)
+    if result.get("log_tail"):
+        print(result["log_tail"], file=sys.stderr)
+    return 1
+
+
+ROTATION_PREVIOUS_OBJECT_NAME = "ssh-key-previous.enc"
+
+
+def _key_body(public_key: str) -> str:
+    parts = public_key.split()
+    for i, part in enumerate(parts):
+        if part.startswith(("ssh-", "ecdsa-", "sk-")) and i + 1 < len(parts):
+            return parts[i + 1]
+    return parts[1] if len(parts) > 1 else public_key
+
+
+def _remove_authorized_key_command(public_key: str) -> str:
+
+    body = shlex.quote(_key_body(public_key))
+    return ("f=/root/.ssh/authorized_keys; "
+            f"awk -v k={body} '{{keep=1; for(i=1;i<=NF;i++) if($i==k) keep=0}} keep' \"$f\" > \"$f.lis\" "
+            "&& cat \"$f.lis\" > \"$f\" && rm -f \"$f.lis\"")
+
+
+def key_rotation_state() -> dict | None:
+    def _do():
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT started_at, previous_fingerprint, previous_public_key, "
+                               "new_public_key, previous_linode_ssh_key_id FROM key_rotation "
+                               "WHERE id = 1").fetchone()
+            nodes = conn.execute("SELECT name, status, detail, updated_at FROM key_rotation_nodes "
+                                 "ORDER BY name").fetchall()
+            return row, nodes
+        finally:
+            conn.close()
+
+    row, nodes = _retry_db(_do)
+    if row is None:
+        return None
+    return {"started_at": row[0], "previous_fingerprint": row[1], "previous_public_key": row[2],
+            "new_public_key": row[3], "previous_linode_ssh_key_id": row[4],
+            "nodes": [{"name": n, "status": st, "detail": d, "updated_at": u} for n, st, d, u in nodes]}
+
+
+def _set_rotation_node(name: str, status: str, detail: str | None = None) -> None:
+    def _do():
+        conn = _connect()
+        try:
+            conn.execute("INSERT INTO key_rotation_nodes (name, status, detail, updated_at) VALUES "
+                         "(?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET status = excluded.status, "
+                         "detail = excluded.detail, updated_at = excluded.updated_at",
+                         (name, status, detail, datetime.now(UTC).isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_db(_do)
+
+
+def previous_key_path() -> Path:
+    key = deployment_ssh_key_path()
+    return key.with_name(key.name + ".previous")
+
+
+def _move_node_to_new_key(name: str, record: dict, key_path: Path, rotation: dict) -> str:
+
+    host = _ssh_target(record, name)
+    new_pub = rotation["new_public_key"]
+    engine.ssh_run(host, str(key_path), "grep -qF " + shlex.quote(_key_body(new_pub))
+                   + " /root/.ssh/authorized_keys || { " + _append_authorized_key_command(new_pub) + "; }",
+                   retries=2)
+
+    with engine.only_this_ssh_key():
+        engine.ssh_run(host, str(key_path), "true", retries=2)
+        engine.ssh_run(host, str(key_path), _remove_authorized_key_command(
+            rotation["previous_public_key"]), retries=2)
+        engine.ssh_run(host, str(key_path), "true", retries=2)
+    return "moved to the new key"
+
+
+@dataclass
+class KeyRotationResult:
+    started: bool = False
+    moved: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    finished: bool = False
+    problems: list[str] = field(default_factory=list)
+
+
+def rotate_deployment_ssh_key(client, *, on_progress: Callable[[str], None] | None = None,
+                              on_warning: Callable[[str], None] | None = None) -> KeyRotationResult:
+
+    say = on_progress or (lambda _m: None)
+    if key_rotation_state() is not None:
+        raise engine.ConfigError("a key rotation is already in progress -- `rotate-credentials ssh-key "
+                                 "--continue` moves the remaining nodes.")
+    passphrase = os.environ.get(SSH_KEY_PASSPHRASE_ENV) or ""
+    if len(passphrase) < MIN_SSH_KEY_PASSPHRASE_LENGTH:
+        raise engine.ConfigError(f"{SSH_KEY_PASSPHRASE_ENV} must be set (the old key is kept "
+                                 "encrypted with it until the rotation finishes).")
+    key_path = deployment_ssh_key_path()
+    if not key_path.is_file():
+        raise engine.ConfigError(f"no deployment SSH key at {key_path}.")
+    old_private = key_path.read_bytes()
+    old_public = _public_key_text(key_path, old_private)
+    if not old_public:
+        raise engine.ConfigError("couldn't read the current key's public half.")
+    old_row = _deployment_secret_row()
+    with tempfile.TemporaryDirectory() as tmp:
+        new_path = Path(tmp) / "new_key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+                        f"{LINODE_SSH_KEY_LABEL_PREFIX}-{socket.gethostname()}", "-f", str(new_path)],
+                       check=True, capture_output=True, timeout=30)
+        new_private = new_path.read_bytes()
+        new_public = new_path.with_name("new_key.pub").read_text().strip()
+    blob = encrypt_ssh_key(old_private, passphrase)
+    names = list(load_registry())
+
+    def _start():
+        conn = _connect()
+        try:
+            conn.execute("INSERT INTO key_rotation (id, started_at, previous_blob, "
+                         "previous_fingerprint, previous_public_key, new_public_key, "
+                         "previous_linode_ssh_key_id) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                         (datetime.now(UTC).isoformat(), blob, hashlib.sha256(old_private).hexdigest(),
+                          old_public, new_public, old_row[4] if old_row else None))
+            for name in names:
+                conn.execute("INSERT OR REPLACE INTO key_rotation_nodes (name, status, detail, "
+                             "updated_at) VALUES (?, 'pending', NULL, ?)",
+                             (name, datetime.now(UTC).isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+    _retry_db(_start)
+    if osb.is_configured():
+        osb.upload_deployment_file(ROTATION_PREVIOUS_OBJECT_NAME, bytes(blob))
+    prev = previous_key_path()
+    fd = os.open(prev, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(old_private)
+    prev.with_name(prev.name + ".pub").write_text(old_public + "\n")
+    _write_env_settings({engine.PREVIOUS_SSH_KEY_ENV: str(prev)})
+
+    tmp_new = key_path.with_name(key_path.name + ".new")
+    fd = os.open(tmp_new, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(new_private)
+    os.replace(tmp_new, key_path)
+    key_path.with_name(key_path.name + ".pub").write_text(new_public + "\n")
+    protection = protect_deployment_ssh_key(client, key_path)
+    result = KeyRotationResult(started=True, problems=list(protection.problems))
+    say("New deployment SSH key in place; the old one is kept until every node trusts the new one.")
+    record_activity("deployment SSH key rotation started", level="warning", source="system",
+                    action="ssh-key-rotate")
+    more = continue_key_rotation(client, on_progress=on_progress, on_warning=on_warning)
+    result.moved, result.pending, result.failed = more.moved, more.pending, more.failed
+    result.finished = more.finished
+    result.problems += more.problems
+    return result
+
+
+def continue_key_rotation(client, *, on_progress: Callable[[str], None] | None = None,
+                          on_warning: Callable[[str], None] | None = None) -> KeyRotationResult:
+
+    say = on_progress or (lambda _m: None)
+    rotation = key_rotation_state()
+    result = KeyRotationResult()
+    if rotation is None:
+        return result
+    registry = load_registry()
+    key_path = deployment_ssh_key_path()
+    for node in rotation["nodes"]:
+        name = node["name"]
+        if node["status"] == "done":
+            continue
+        record = registry.get(name)
+        if record is None:
+            _set_rotation_node(name, "done", "no longer managed")
+            continue
+        if record.get("current_status") != "running" or record.get("transitioning"):
+            result.pending.append(name)
+            continue
+        try:
+            with _instance_lock(name):
+                detail = _move_node_to_new_key(name, record, key_path, rotation)
+            _set_rotation_node(name, "done", detail)
+            result.moved.append(name)
+            say(f"  {name}: {detail}")
+        except InstanceLockedError:
+            result.pending.append(name)
+        except Exception as e:
+            _set_rotation_node(name, "failed", str(e)[:300])
+            result.failed.append(name)
+            if on_warning is not None:
+                on_warning(f"WARNING: {name}: couldn't move to the new key ({e}); it keeps the old "
+                           "key and is retried.")
+    rotation = key_rotation_state()
+    if rotation and all(n["status"] == "done" for n in rotation["nodes"]):
+        _finish_key_rotation(client, rotation)
+        result.finished = True
+        say("Every node trusts the new key; the old key is removed everywhere.")
+    return result
+
+
+def _finish_key_rotation(client, rotation: dict) -> None:
+    if client is not None and rotation.get("previous_linode_ssh_key_id"):
+        with contextlib_suppress(Exception):
+            for key in engine.retry_transient(lambda: list(client.profile.ssh_keys())):
+                if key.id == rotation["previous_linode_ssh_key_id"]:
+                    engine.retry_transient(key.delete)
+    if osb.is_configured():
+        with contextlib_suppress(Exception):
+            osb.delete_deployment_file(ROTATION_PREVIOUS_OBJECT_NAME)
+    _write_env_settings({engine.PREVIOUS_SSH_KEY_ENV: None})
+    prev = previous_key_path()
+    for path in (prev, prev.with_name(prev.name + ".pub")):
+        with contextlib_suppress(FileNotFoundError):
+            path.unlink()
+
+    def _do():
+        conn = _connect()
+        try:
+            conn.execute("DELETE FROM key_rotation")
+            conn.execute("DELETE FROM key_rotation_nodes")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _retry_db(_do)
+    record_activity("deployment SSH key rotation finished", source="system", action="ssh-key-rotate")
+
+
+CREDENTIAL_KINDS = ("api-token", "bucket-key", "oauth-secret", "ssh-key")
+
+
+def _wait_for_scheduler_reload(changed_at: datetime, timeout_s: float = 120) -> bool:
+
+    beat = None
+    with contextlib_suppress(Exception):
+        beat = get_scheduler_heartbeat()
+    last = datetime.fromisoformat(beat["last_tick"]) if beat and beat.get("last_tick") else None
+    if last is None or (changed_at - last).total_seconds() > 600:
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with contextlib_suppress(Exception):
+            beat = get_scheduler_heartbeat()
+            if beat and datetime.fromisoformat(beat["last_tick"]) > changed_at:
+                return True
+        time.sleep(3)
+    return False
+
+
+def _current_token_object(client):
+    token = engine.load_token()
+    for t in engine.retry_transient(lambda: list(client.profile.tokens())):
+        shown = (t.token or "").rstrip("*")
+        if len(shown) >= 8 and token.startswith(shown):
+            return t
+    return None
+
+
+def rotate_api_token(client, *, on_progress: Callable[[str], None] | None = None) -> dict:
+
+    say = on_progress or (lambda _m: None)
+    old = _current_token_object(client)
+    if old is None:
+        raise engine.ConfigError("couldn't find the current token among the profile's tokens "
+                                 "(it may be an OAuth token) -- rotate it in Cloud Manager instead.")
+    expiry = None
+    if isinstance(old.expiry, datetime) and isinstance(old.created, datetime):
+        expiry = datetime.now(UTC) + (old.expiry - old.created)
+    created = engine.retry_transient(lambda: client.profile.token_create(
+        label=f"instance-scheduler {datetime.now(UTC):%Y-%m-%d}"[:100], expiry=expiry,
+        scopes=old.scopes))
+    new_token = created.token
+    check = engine.build_client(new_token)
+    engine.auth_check(check)
+    changed_at = datetime.now(UTC)
+    _write_env_settings({"LINODE_API_TOKEN": new_token})
+    engine.set_token_on_clients(new_token)
+    say("  new API token written to .env and in use here")
+    if not _wait_for_scheduler_reload(changed_at):
+        raise engine.ConfigError(
+            "the new token is in .env, but the scheduler hasn't picked it up yet -- the old token "
+            f"('{old.label}') was NOT revoked; revoke it in Cloud Manager once the scheduler is running.")
+    engine.retry_transient(old.delete)
+    say(f"  old API token ('{old.label}') revoked")
+    record_activity("Linode API token rotated", level="warning", source="system",
+                    action="credentials-rotate")
+    return {"kind": "api-token", "revoked": old.label}
+
+
+def rotate_bucket_key(client, *, on_progress: Callable[[str], None] | None = None) -> dict:
+
+    say = on_progress or (lambda _m: None)
+    if not osb.is_configured():
+        raise engine.ConfigError("Object Storage isn't configured.")
+    old_access = os.environ["LINODE_OBJ_STORAGE_ACCESS_KEY"]
+    old = next((k for k in engine.retry_transient(lambda: list(client.object_storage.keys()))
+                if k.access_key == old_access), None)
+    if old is None:
+        raise engine.ConfigError("the current bucket key isn't one of this account's keys -- "
+                                 "rotate it where it was created.")
+    access = getattr(old, "bucket_access", None) or None
+    bucket_access = ([{"region": getattr(a, "region", None) or a.get("region"),
+                       "bucket_name": getattr(a, "bucket_name", None) or a.get("bucket_name"),
+                       "permissions": getattr(a, "permissions", None) or a.get("permissions")}
+                      for a in access] if access else None)
+    new = engine.retry_transient(lambda: client.object_storage.keys_create(
+        f"instance-scheduler {datetime.now(UTC):%Y-%m-%d}"[:50], bucket_access=bucket_access))
+    configure_system_backup(os.environ["LINODE_OBJ_STORAGE_BUCKET"],
+                            os.environ["LINODE_OBJ_STORAGE_ENDPOINT"], new.access_key, new.secret_key)
+    say("  new bucket key tested and written to .env")
+    engine.retry_transient(old.delete)
+    say(f"  old bucket key ({old.label}) deleted")
+    record_activity("Object Storage key rotated", level="warning", source="system",
+                    action="credentials-rotate")
+    return {"kind": "bucket-key", "revoked": old.label}
+
+
+def rotate_oauth_secret(client, *, on_progress: Callable[[str], None] | None = None) -> dict:
+
+    from linode_api4.objects import OAuthClient
+    client_id = os.environ.get("LINODE_OAUTH_CLIENT_ID")
+    if not client_id:
+        raise engine.ConfigError("LINODE_OAUTH_CLIENT_ID isn't set -- no dashboard login to rotate.")
+    secret = engine.retry_transient(lambda: OAuthClient(client, client_id).reset_secret())
+    _write_env_settings({"LINODE_OAUTH_CLIENT_SECRET": secret})
+    (on_progress or (lambda _m: None))("  new OAuth client secret written to .env")
+    record_activity("dashboard OAuth client secret rotated", level="warning", source="system",
+                    action="credentials-rotate")
+    return {"kind": "oauth-secret"}
+
+
+def cmd_rotate_credentials(client, args) -> int:
+    try:
+        if args.kind == "ssh-key":
+            if args.continue_rotation:
+                result = continue_key_rotation(client, on_progress=print, on_warning=_print_to_stderr)
+            else:
+                result = rotate_deployment_ssh_key(client, on_progress=print, on_warning=_print_to_stderr)
+            for p in result.problems:
+                print(f"  {p}", file=sys.stderr)
+            if result.finished:
+                print("Rotation finished: every node trusts only the new key.")
+            elif key_rotation_state() is not None:
+                print(f"Still to move (after their next start, automatically): "
+                      f"{', '.join(result.pending + result.failed) or 'none'}")
+            return 1 if result.failed else 0
+        fn = {"api-token": rotate_api_token, "bucket-key": rotate_bucket_key,
+              "oauth-secret": rotate_oauth_secret}[args.kind]
+        fn(client, on_progress=print)
+    except engine.ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    print(f"{args.kind} rotated.")
+    return 0
+
+
+def restore_previous_key_from_database(passphrase: str) -> Path | None:
+
+    def _do():
+        conn = _connect()
+        try:
+            return conn.execute("SELECT previous_blob, previous_public_key FROM key_rotation "
+                                "WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+
+    row = _retry_db(_do)
+    if row is None:
+        return None
+    prev = previous_key_path()
+    prev.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(prev, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(decrypt_ssh_key(bytes(row[0]), passphrase))
+    prev.with_name(prev.name + ".pub").write_text(row[1] + "\n")
+    _write_env_settings({engine.PREVIOUS_SSH_KEY_ENV: str(prev)})
+    return prev
 
 
 def restore_ssh_key_from_database(dest: Path, passphrase: str, *, force: bool = False) -> Path:
@@ -8067,6 +9369,174 @@ def list_database_snapshots() -> list[str]:
     return keys
 
 
+RESTORE_ITEM_KINDS = ("schedule", "hooks", "group")
+
+
+def _open_snapshot(snapshot_key: str | None, from_file: Path | None, tmp: Path) -> sqlite3.Connection:
+    staged = tmp / "item.db"
+    if from_file is not None:
+        if not from_file.is_file():
+            raise engine.ConfigError(f"no file at {from_file}.")
+        staged.write_bytes(from_file.read_bytes())
+    else:
+        key = snapshot_key or list_database_snapshots()[-1]
+        try:
+            osb.download_database_snapshot(key, staged)
+        except osb.ObjectStorageError as e:
+            raise engine.ConfigError(f"couldn't download snapshot {key}: {e}") from e
+    problem = osb.database_integrity_problem(staged)
+    if problem:
+        raise engine.ConfigError(f"the snapshot fails its integrity check: {problem}")
+    return sqlite3.connect(f"file:{staged}?mode=ro", uri=True)
+
+
+def read_item_from_snapshot(kind: str, name: str, *, snapshot_key: str | None = None,
+                            from_file: Path | None = None) -> dict | None:
+
+    if kind not in RESTORE_ITEM_KINDS:
+        raise engine.ConfigError(f"kind must be one of {', '.join(RESTORE_ITEM_KINDS)}.")
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _open_snapshot(snapshot_key, from_file, Path(tmp))
+        try:
+            if kind == "schedule":
+                row = conn.execute("SELECT timezone, rules, enabled FROM schedules "
+                                   "WHERE instance_name = ?", (name,)).fetchone()
+                return None if row is None else {"timezone": row[0], "rules": json.loads(row[1]),
+                                                 "enabled": bool(row[2])}
+            if kind == "hooks":
+                row = conn.execute("SELECT config FROM instance_hooks WHERE instance_name = ?",
+                                   (name,)).fetchone()
+                return None if row is None else json.loads(row[0])
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_groups)")}
+            holidays = "account_holidays" if "account_holidays" in cols else "'follow'"
+            row = conn.execute(f"SELECT id, timezone, rules, enabled, {holidays} FROM "
+                               "schedule_groups WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                return None
+            group = {"timezone": row[1], "rules": json.loads(row[2] or "[]"),
+                     "enabled": bool(row[3]), "account_holidays": row[4] or "follow",
+                     "hooks": None, "depends_on": [], "members": []}
+            with contextlib_suppress(sqlite3.Error):
+                hooks = conn.execute("SELECT config FROM group_hooks WHERE group_id = ?",
+                                     (row[0],)).fetchone()
+                group["hooks"] = json.loads(hooks[0]) if hooks else None
+            with contextlib_suppress(sqlite3.Error):
+                group["depends_on"] = [r[0] for r in conn.execute(
+                    "SELECT g.name FROM group_dependencies d JOIN schedule_groups g "
+                    "ON g.id = d.depends_on_group_id WHERE d.group_id = ? ORDER BY g.name", (row[0],))]
+            group["members"] = [r[0] for r in conn.execute(
+                "SELECT name FROM instances WHERE group_id = ? ORDER BY name", (row[0],))]
+            return group
+        finally:
+            conn.close()
+
+
+@dataclass
+class RestoreItemResult:
+    kind: str
+    name: str
+    restored: dict
+    applied: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+
+def restore_item_from_snapshot(
+    client, kind: str, name: str, *, snapshot_key: str | None = None,
+    from_file: Path | None = None, with_members: bool = False, actor: str | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> RestoreItemResult:
+
+    item = read_item_from_snapshot(kind, name, snapshot_key=snapshot_key, from_file=from_file)
+    if item is None:
+        raise engine.ConfigError(f"the snapshot has no {kind} for '{name}'.")
+    result = RestoreItemResult(kind=kind, name=name, restored=item)
+    if kind == "schedule":
+        if name not in load_registry():
+            raise NotOnboardedError(f"'{name}' is not onboarded now -- recover or onboard it first.")
+        save_instance_schedule(client, name, item["timezone"], item["rules"], item["enabled"],
+                               on_warning=on_warning)
+        result.applied.append("schedule")
+    elif kind == "hooks":
+        if name not in load_registry():
+            raise NotOnboardedError(f"'{name}' is not onboarded now -- recover or onboard it first.")
+        set_instance_hooks(name, item, client=client, actor=actor, on_warning=on_warning)
+        result.applied.append("hooks")
+    else:
+        if get_schedule_group(name) is None:
+            create_schedule_group(name, item["timezone"], on_warning=on_warning)
+            result.applied.append("group created")
+        set_group_schedule(client, name, item["timezone"], item["rules"], item["enabled"],
+                           on_warning=on_warning)
+        result.applied.append("schedule")
+        steps: list[tuple[str, Callable[[], object]]] = [
+            ("holiday setting", lambda: set_group_account_holidays(
+                client, name, item["account_holidays"], on_warning=on_warning))]
+        if item["hooks"]:
+            steps.append(("hooks", lambda: set_group_hooks(name, item["hooks"], client=client,
+                                                            actor=actor, on_warning=on_warning)))
+        existing = [g for g in item["depends_on"] if get_schedule_group(g) is not None]
+        missing = sorted(set(item["depends_on"]) - set(existing))
+        if missing:
+            result.problems.append(f"start order: group(s) {', '.join(missing)} no longer exist")
+        steps.append(("start order", lambda: set_group_dependencies(client, name, existing,
+                                                                     on_warning=on_warning)))
+        if with_members:
+            registry = load_registry()
+            for member in item["members"]:
+                record = registry.get(member)
+                if record is None:
+                    result.problems.append(f"member {member}: not onboarded now")
+                    continue
+                if record.get("group_id") is not None:
+                    current = _group_row_by_id(record["group_id"])
+                    if current and current["name"] != name:
+                        result.problems.append(f"member {member}: now in group '{current['name']}' -- left there")
+                    continue
+                def _add(m: str = member) -> object:
+                    return assign_instance_to_group(client, m, name, on_warning=on_warning)
+                steps.append((f"member {member}", _add))
+        for label, step in steps:
+            try:
+                step()
+                result.applied.append(label)
+            except Exception as e:
+                result.problems.append(f"{label}: {e}")
+    record_activity(f"restored {kind} of '{name}' from "
+                    f"{'file ' + str(from_file) if from_file else snapshot_key or 'the latest snapshot'}"
+                    f": {', '.join(result.applied)}"
+                    + (f" (problems: {'; '.join(result.problems)})" if result.problems else ""),
+                    level="warning" if result.problems else "info", source="system",
+                    instance_name=name if kind != "group" else None, action="restore-item",
+                    actor=actor)
+    return result
+
+
+def cmd_restore_item(client, args) -> int:
+    from_file = Path(args.from_file) if args.from_file else None
+    try:
+        if args.show:
+            item = read_item_from_snapshot(args.kind, args.name, snapshot_key=args.snapshot,
+                                           from_file=from_file)
+            if item is None:
+                print(f"The snapshot has no {args.kind} for '{args.name}'.")
+                return 1
+            print(json.dumps(item, indent=2))
+            return 0
+        result = restore_item_from_snapshot(
+            client, args.kind, args.name, snapshot_key=args.snapshot, from_file=from_file,
+            with_members=args.with_members, on_warning=_print_to_stderr)
+    except InstanceLockedError as e:
+        print(f"{e}", file=sys.stderr)
+        return 3
+    except engine.ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    print(f"Restored {args.kind} of '{args.name}': {', '.join(result.applied)}.")
+    for p in result.problems:
+        print(f"  not restored: {p}", file=sys.stderr)
+    return 1 if result.problems else 0
+
+
 def restore_from_backup(
     *, snapshot_key: str | None = None, from_file: Path | None = None,
     known_hosts_file: Path | None = None, force: bool = False,
@@ -8281,6 +9751,15 @@ def cmd_ssh_key_restore(args) -> int:
         if getattr(args, "save_passphrase", False):
             _write_env_settings({SSH_KEY_PASSPHRASE_ENV: passphrase})
             print(f"Saved it to .env as {SSH_KEY_PASSPHRASE_ENV}.")
+
+    try:
+        prev = restore_previous_key_from_database(passphrase)
+        if prev is not None:
+            print(f"A key rotation is in progress: the previous key is restored to {prev} so nodes "
+                  "not yet moved stay reachable.")
+    except Exception as e:
+        print(f"WARNING: a key rotation is in progress but the previous key couldn't be restored "
+              f"({e}) -- nodes not yet moved may be unreachable.", file=sys.stderr)
     return 0
 
 
@@ -9981,6 +11460,11 @@ class PollScheduler:
             with contextlib_suppress(Exception):
                 self._report_schedule_mismatches(now)
             with contextlib_suppress(Exception):
+                process_due_deletions(self._client, now=now, on_warning=self._on_warning)
+            with contextlib_suppress(Exception):
+                if key_rotation_state() is not None:
+                    continue_key_rotation(self._client, on_warning=self._on_warning)
+            with contextlib_suppress(Exception):
                 evaluate_alerts(now=now, include_scheduler=False, client=self._client)
         if ((self._last_verify is None and (now - self._started_at).total_seconds() >= 600)
                 or (self._last_verify is not None and (now - self._last_verify).total_seconds()
@@ -9997,6 +11481,13 @@ class PollScheduler:
         if (self._last_key_protect is None
                 or (now - self._last_key_protect).total_seconds() >= 3600):
             self._last_key_protect = now
+            with contextlib_suppress(Exception):
+                backup_release_copy()
+            with contextlib_suppress(Exception):
+                days = drill_interval_days()
+                last = recovery_drill_status().get("started_at")
+                if days and (last is None or (now - datetime.fromisoformat(last)).days >= days):
+                    run_recovery_drill(self._client)
             with contextlib_suppress(Exception):
                 key = protect_deployment_ssh_key(self._client, deployment_ssh_key_path())
                 for problem in key.problems:
@@ -10502,13 +11993,14 @@ def rollback_to_backup(
 
 @dataclass
 class BackupDeleteResult:
-    outcome: Literal["deleted", "forgotten", "aborted_by_user", "incomplete"]
+    outcome: Literal["deleted", "forgotten", "aborted_by_user", "incomplete", "pending_deletion"]
     problems: list[str] = field(default_factory=list)
+    pending_deletion: dict | None = None
 
 
 @_logs_activity("backup-delete")
 def delete_migration_backup(
-    client, name: str, *, confirm: Callable[[], bool] | None = None,
+    client, name: str, *, grace: bool = False, confirm: Callable[[], bool] | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_warning: Callable[[str], None] | None = None,
 ) -> BackupDeleteResult:
@@ -10535,6 +12027,19 @@ def delete_migration_backup(
                         "The original system can no longer be rolled back to after this.")
         if confirm is not None and not confirm():
             return BackupDeleteResult(outcome="aborted_by_user")
+        if grace and deletion_grace_days() > 0:
+            if pending_deletion_for(name, "migration_backup") is not None:
+                raise engine.ConfigError(f"the backup of '{name}' is already pending deletion.")
+            resources = []
+            if record["backup"].get("instance_id"):
+                resources.append({"type": "instance", "id": record["backup"]["instance_id"],
+                                  "role": "backup", "action": "delete"})
+            for vol in record["backup"].get("volumes") or []:
+                resources.append({"type": "volume", "id": vol["volume_id"], "role": "backup",
+                                  "action": "delete"})
+            entry = schedule_pending_deletion(client, name, "migration_backup", resources,
+                                              on_progress=on_progress, on_warning=on_warning)
+            return BackupDeleteResult(outcome="pending_deletion", pending_deletion=entry)
         problems = engine.delete_migration_backup_resources(client, record, name,
                                                              on_progress=on_progress)
         if problems:
@@ -10621,7 +12126,8 @@ def cmd_backup_delete(client, args) -> int:
         return input(f"Type '{args.name}' to confirm: ").strip() == args.name
 
     try:
-        result = delete_migration_backup(client, args.name, confirm=_confirm, on_progress=print,
+        result = delete_migration_backup(client, args.name, grace=not getattr(args, "now", False),
+                                         confirm=_confirm, on_progress=print,
                                          on_warning=_print_to_stderr)
     except InstanceLockedError as e:
         print(f"{e}", file=sys.stderr)
@@ -10637,7 +12143,82 @@ def cmd_backup_delete(client, args) -> int:
         for p in result.problems:
             print(f"  {p}", file=sys.stderr)
         return 1
+    if result.outcome == "pending_deletion":
+        entry = result.pending_deletion or {}
+        print(f"The backup of '{args.name}' is pending deletion (#{entry.get('id')}). Nothing has "
+              f"been deleted yet: it happens automatically on {str(entry.get('due_at'))[:10]}."
+              f"\n  Keep it after all:  pending-deletions --recover {entry.get('id')}"
+              f"\n  Delete it now:      pending-deletions --delete-now {entry.get('id')}")
+        return 0
     print("Backup deleted." if result.outcome == "deleted" else "Backup record removed.")
+    return 0
+
+
+def cmd_release_backup(args) -> int:
+    if args.output:
+        info = build_release_archive(Path(args.output))
+        print(f"Wrote {args.output}: release {info['version']}, {info['files']} files, "
+              f"{info['wheels']} dependency wheels, {info['bytes'] // 1024} KiB.")
+        return 0
+    if not osb.is_configured():
+        print("Object Storage isn't configured -- use --output to write the archive locally.",
+              file=sys.stderr)
+        return 1
+    try:
+        state = backup_release_copy(force=args.force, on_progress=print)
+    except Exception as e:
+        print(f"Couldn't save the release copy: {e}", file=sys.stderr)
+        return 1
+    if state is None:
+        print(f"Release {release_version()} is already saved and unchanged (use --force to upload again).")
+    return 0
+
+
+def cmd_pending_deletions(client, args) -> int:
+    if args.recover is None and args.delete_now is None:
+        entries = list_pending_deletions(include_done=args.all)
+        if args.json:
+            print(json.dumps(entries, indent=2, default=str))
+            return 0
+        if not entries:
+            print("Nothing is pending deletion.")
+            return 0
+        for e in entries:
+            what = ", ".join(f"{r['type']} {r['id']}" + (" (kept)" if r.get("action") == "untag"
+                                                        else "") for r in e["resources"])
+            kind = "node" if e["kind"] == "node" else "pre-migration backup"
+            print(f"#{e['id']}  {kind} '{e['name']}'  {e['status']}  due {e['due_at'][:10]}  "
+                  f"{what}" + (f"\n      {e['detail']}" if e.get("detail") else ""))
+        return 0
+    entry_id = args.recover if args.recover is not None else args.delete_now
+    entry = get_pending_deletion(entry_id)
+    if entry is None:
+        print(f"No pending deletion #{entry_id}.", file=sys.stderr)
+        return 1
+    if args.delete_now is not None and not args.yes:
+        answer = input(f"This permanently deletes what's listed for '{entry['name']}' now -- it "
+                       f"can't be recovered afterwards. Type '{entry['name']}' to confirm: ")
+        if answer.strip() != entry["name"]:
+            print("Aborted; nothing changed.")
+            return 1
+    try:
+        if args.recover is not None:
+            done = recover_pending(client, entry_id, on_progress=print, on_warning=_print_to_stderr)
+            print(f"'{done['name']}' recovered.")
+            return 0
+        done = delete_pending_now(client, entry_id, on_progress=print,
+                                  on_warning=_print_to_stderr)
+    except InstanceLockedError as e:
+        print(f"{e}", file=sys.stderr)
+        return 3
+    except engine.ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    if done["status"] == "failed":
+        print(f"Not fully deleted -- kept open and retried automatically: {done['detail']}",
+              file=sys.stderr)
+        return 1
+    print(f"Deleted: {done['detail']}")
     return 0
 
 
@@ -10818,6 +12399,105 @@ def token_health(client, *, now: datetime | None = None) -> list[HealthProblem]:
     return problems
 
 
+CLOCK_SKEW_LIMIT_SECONDS = 60
+_CLOCK_CHECK_INTERVAL_S = 900
+_clock_cache: dict = {"at": 0.0, "problems": []}
+
+
+_bucket_protection_cache: dict = {"at": None, "status": {}}
+
+
+def _bucket_protection_cached(now: datetime) -> dict:
+
+    at = _bucket_protection_cache["at"]
+    if at is not None and (now - at).total_seconds() < 3600:
+        return _bucket_protection_cache["status"]
+    status = osb.bucket_protection_status()
+    if not status.get("error") and (status.get("versioning") != "Enabled" or not status.get("lifecycle")):
+        try:
+            status = osb.enable_bucket_protection()
+            record_activity("turned on versioning (and old-version expiry) for the backup bucket",
+                            source="system", action="bucket-protection")
+        except Exception as e:
+            status = {**status, "enable_error": str(e)}
+    _bucket_protection_cache.update(at=now, status=status)
+    return status
+
+
+def cmd_bucket_protection(args) -> int:
+    if not osb.is_configured():
+        print("Object Storage isn't configured.", file=sys.stderr)
+        return 1
+    try:
+        if args.restore_version:
+            if not args.key:
+                print("--restore-version needs --key.", file=sys.stderr)
+                return 1
+            osb.restore_object_version(args.key, args.restore_version)
+            print(f"{args.key}: version {args.restore_version} is the current one again.")
+            return 0
+        if args.key:
+            for v in osb.list_object_versions(args.key):
+                state = "deleted" if v["deleted"] else f"{v['size']} bytes"
+                print(f"{v['version_id']}  {v['last_modified']}  {state}"
+                      + ("  (current)" if v["latest"] else ""))
+            return 0
+        status = osb.enable_bucket_protection() if args.enable else osb.bucket_protection_status()
+    except Exception as e:
+        print(f"Couldn't {'change' if args.enable else 'read'} the bucket settings: {e}", file=sys.stderr)
+        return 1
+    print(f"Versioning: {status.get('versioning')}; old-version expiry rule: "
+          f"{'yes' if status.get('lifecycle') else 'no'}"
+          + (f"; problem: {status['error']}" if status.get("error") else ""))
+    return 0 if status.get("versioning") == "Enabled" else 1
+
+
+def clock_skew_seconds(url: str = "https://api.linode.com/v4/regions") -> float | None:
+
+    started = time.time()
+    response = requests.get(url, timeout=10)
+    finished = time.time()
+    header = response.headers.get("Date")
+    if not header:
+        return None
+    remote = parsedate_to_datetime(header).timestamp()
+
+    return (started + finished) / 2 - remote
+
+
+def _ntp_synchronized() -> bool | None:
+
+    if shutil.which("timedatectl") is None:
+        return None
+    try:
+        out = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                             capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"yes": True, "no": False}.get(out)
+
+
+def clock_health(*, force: bool = False) -> list[HealthProblem]:
+
+    if not force and time.monotonic() - _clock_cache["at"] < _CLOCK_CHECK_INTERVAL_S:
+        return list(_clock_cache["problems"])
+    problems = []
+    skew = None
+    with contextlib_suppress(Exception):
+        skew = clock_skew_seconds()
+    if skew is not None and abs(skew) > CLOCK_SKEW_LIMIT_SECONDS:
+        problems.append(HealthProblem(
+            "clock", f"this host's clock is {abs(skew):.0f}s {'ahead of' if skew > 0 else 'behind'} "
+            "Linode's -- schedules fire at the wrong time and the scheduler lease can misjudge "
+            "another host. Enable time synchronization (e.g. `timedatectl set-ntp true`)."))
+    elif _ntp_synchronized() is False:
+        problems.append(HealthProblem(
+            "clock", "the system clock isn't time-synchronized (timedatectl reports "
+            "NTPSynchronized=no); it will drift. Enable it with `timedatectl set-ntp true`."))
+    _clock_cache.update(at=time.monotonic(), problems=problems)
+    return problems
+
+
 def disk_health() -> list[HealthProblem]:
     try:
         usage = shutil.disk_usage(REGISTRY_PATH.parent if REGISTRY_PATH.parent.exists() else Path("."))
@@ -10836,6 +12516,7 @@ def check_health(*, now: datetime | None = None, include_scheduler: bool = True,
     problems: list[HealthProblem] = list(disk_health())
     if client is not None:
         problems += token_health(client, now=now)
+        problems += clock_health()
     if include_scheduler:
         beat = None
         with contextlib_suppress(Exception):
@@ -10896,6 +12577,42 @@ def check_health(*, now: datetime | None = None, include_scheduler: bool = True,
             problems.append(HealthProblem(
                 "schedule", f"{len(off)} node(s) off their schedule: "
                 + ", ".join(f"{m.name} ({m.current}, should be {m.desired})" for m in off[:10])))
+    with contextlib_suppress(Exception):
+        if osb.is_configured():
+            protection = _bucket_protection_cached(now)
+            if protection.get("error"):
+                problems.append(HealthProblem("bucket-versioning", protection["error"]))
+            elif protection.get("versioning") != "Enabled":
+                problems.append(HealthProblem(
+                    "bucket-versioning", "versioning is off on the backup bucket -- an overwritten "
+                    "or deleted backup can't be recovered. Run `bucket-protection --enable` (the "
+                    "access key needs permission to change bucket settings)."))
+    with contextlib_suppress(Exception):
+        drill = recovery_drill_status()
+        days = drill_interval_days()
+        if drill and not drill.get("ok"):
+            problems.append(HealthProblem(
+                "recovery-drill", "the last recovery drill failed: "
+                + "; ".join(drill.get("problems") or [])[:300]))
+        elif days and drill.get("finished_at") and (
+                now - datetime.fromisoformat(drill["finished_at"])).days > days + 1:
+            problems.append(HealthProblem("recovery-drill",
+                                          f"no recovery drill has run for over {days + 1} days"))
+    with contextlib_suppress(Exception):
+        release = release_backup_status()
+        if osb.is_configured() and release.get("last_error"):
+            problems.append(HealthProblem(
+                "release-copy", "the copy of this release in Object Storage couldn't be saved: "
+                f"{release['last_error'][:200]}"))
+    with contextlib_suppress(Exception):
+        stuck = [e for e in list_pending_deletions()
+                 if e["status"] == "failed"
+                 or datetime.fromisoformat(e["due_at"]) < now - timedelta(days=1)]
+        if stuck:
+            problems.append(HealthProblem(
+                "pending-deletion", f"{len(stuck)} pending deletion(s) overdue or failing: "
+                + ", ".join(f"#{e['id']} {e['name']}" for e in stuck[:10])
+                + " -- see the Pending deletion page"))
     return problems
 
 
@@ -12525,6 +14242,8 @@ class RebuildResult:
     invalid: list[str] = field(default_factory=list)
     conflicts: list[dict] = field(default_factory=list)
 
+    pending: list[str] = field(default_factory=list)
+
     @property
     def ok(self) -> bool:
 
@@ -12711,10 +14430,17 @@ def rebuild_instances(
 
         raise engine.ConfigError(f"could not scan tagged resources: {e}") from e
     _discover_from_object_storage(client, found, on_warning)
+    pending_names: set[str] = set()
+    try:
+        pending_names = restore_pending_deletions_from_object_storage(on_progress, on_warning)
+    except Exception as e:
+        if on_warning is not None:
+            on_warning(f"WARNING: couldn't restore pending deletions from Object Storage ({e}).")
     if not found and not conflicts:
         return RebuildResult(nothing_found=True)
 
     recovered, partial, skipped, incomplete, failed, invalid = [], [], [], [], [], []
+    pending_found: list[str] = []
     ambiguous: list[tuple[str, dict]] = []
 
 
@@ -12731,6 +14457,11 @@ def rebuild_instances(
             invalid.append(name)
             continue
 
+        if name in pending_names and name not in registry:
+
+
+            pending_found.append(name)
+            continue
         if name in registry and not force:
             skipped.append(name)
             continue
@@ -12926,6 +14657,21 @@ def rebuild_instances(
                             f"  WARNING: '{name}' recovered, but its hooks could not be "
                             f"restored: {e} -- set them again with hooks-set."
                         )
+
+
+                due = None
+                with contextlib_suppress(Exception):
+                    os_vol_id = record["os_volume_id"]
+                    os_vol = engine.retry_transient(
+                        lambda: client.load(Volume, os_vol_id))
+                    due = pending_marker_from_tags(os_vol.tags, name)
+                if due is not None:
+                    _rebuilt_node_to_pending(client, name, load_registry().get(name) or record, due)
+                    if on_progress is not None:
+                        on_progress(f"  '{name}' is pending deletion (due {due}) -- restored as a "
+                                    "pending deletion; recover it from Pending deletion if needed")
+                    pending_found.append(name)
+                    continue
         except InstanceLockedError as e:
             if on_warning is not None:
                 on_warning(f"  WARNING: {e} -- skipping '{name}' this pass, safe to re-run "
@@ -13013,6 +14759,9 @@ def rebuild_instances(
                     "happen -- investigate). Review tags directly in Cloud Manager and remove "
                     "the stale one, then re-run rebuild."
                 )
+        if pending_found:
+            on_progress(f"  pending deletion (kept as such, recoverable from Pending deletion): "
+                        f"{', '.join(pending_found)}")
         if invalid:
             on_progress(
                 f"  WARNING: skipped {len(invalid)} tag-derived name(s) that failed validation "
@@ -13038,7 +14787,7 @@ def rebuild_instances(
     return RebuildResult(
         scanned_count=len(found), recovered=recovered, partial=partial, skipped=skipped,
         failed=failed, incomplete=incomplete, ambiguous=ambiguous, invalid=invalid,
-        conflicts=conflicts,
+        conflicts=conflicts, pending=pending_found,
     )
 
 
@@ -13384,14 +15133,30 @@ API_TOKEN_FINE_SCOPES: dict[str, str] = {
     "instances:vpc-address": "move a stopped instance to another VPC address",
     "tokens:manage": "create, list and revoke API tokens (never wider than its own)",
     "logs:read": "service log files",
+    "deletions:read": "list nodes and backups pending deletion",
+    "deletions:recover": "recover a node or backup pending deletion",
+    "deletions:delete-now": "carry out a pending deletion now (it can't be recovered afterwards)",
+    "backups:read": "list database snapshots and preview an item in one",
+    "backups:restore-item": "restore one schedule, instance's hooks or group from a snapshot",
+    "backups:release-copy": "save a copy of the installed release to Object Storage",
+    "backups:versioning": "turn on bucket versioning, list and bring back object versions",
+    "backups:drill": "run a recovery drill (creates and deletes a throwaway VM)",
+    "credentials:rotate": "rotate the Linode API token, bucket keys, OAuth secret or deployment "
+                          "SSH key (admin-level: it replaces credentials)",
 }
 API_TOKEN_SCOPE_BUNDLES: dict[str, tuple[str, ...]] = {
     "read": ("instances:list", "instances:status", "instances:history", "savings:read",
-             "activity:read", "schedules:read", "groups:read", "hooks:read"),
+             "activity:read", "schedules:read", "groups:read", "hooks:read", "deletions:read",
+             "backups:read", "system:read"),
     "operate": ("instances:start", "instances:stop", "instances:extend", "groups:start",
-                "groups:stop", "hooks:run", "instances:clear-lock", "schedules:catch-up"),
+                "groups:stop", "hooks:run", "instances:clear-lock", "schedules:catch-up",
+                "system:backup", "backups:release-copy"),
     "configure": ("schedules:write", "groups:write", "groups:membership", "dependencies:write",
-                  "mode:write", "instances:vpc-address"),
+                  "mode:write", "instances:vpc-address", "deletions:recover",
+                  "backups:restore-item", "backups:versioning", "backups:drill",
+                  "system:configure"),
+
+
     "admin": tuple(API_TOKEN_FINE_SCOPES),
 }
 API_TOKEN_SCOPES = tuple(API_TOKEN_SCOPE_BUNDLES) + tuple(API_TOKEN_FINE_SCOPES)
@@ -13796,6 +15561,77 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     backup_delete_parser.add_argument("--name", required=True, type=validate_instance_name)
     backup_delete_parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+    backup_delete_parser.add_argument(
+        "--now", action="store_true",
+        help="Delete at once instead of holding it for the grace period (see pending-deletions).")
+
+    drill_parser = subparsers.add_parser(
+        "recovery-drill",
+        help="Prove a new host could take over: a throwaway VM installs the release copy and the "
+        "latest snapshot (read-only), checks everything works, and is deleted.",
+    )
+    drill_parser.add_argument("--region", help="Region for the VM (default: this host's).")
+    drill_parser.add_argument("--keep-vm", action="store_true", help="Don't delete the VM (to inspect it).")
+    drill_check_parser = subparsers.add_parser(
+        "recovery-drill-check",
+        help="On a host restored by `install.sh recover --drill`: check everything would work.")
+    drill_check_parser.add_argument("--report", help="Also write the JSON report to this file.")
+
+    rot_parser = subparsers.add_parser(
+        "rotate-credentials",
+        help="Replace a credential (e.g. after it may have leaked): the Linode API token, the "
+        "Object Storage key, the dashboard OAuth secret, or the deployment SSH key on every node.",
+    )
+    rot_parser.add_argument("kind", choices=CREDENTIAL_KINDS)
+    rot_parser.add_argument("--continue", dest="continue_rotation", action="store_true",
+                            help="ssh-key: move the nodes not yet moved (the scheduler also does this).")
+
+    ri_parser = subparsers.add_parser(
+        "restore-item",
+        help="Put back one item as it was in a database snapshot -- an instance's schedule or "
+        "hooks, or a group -- without restoring the whole database.",
+    )
+    ri_parser.add_argument("kind", choices=RESTORE_ITEM_KINDS)
+    ri_parser.add_argument("--name", required=True, help="The instance (schedule/hooks) or group.")
+    ri_parser.add_argument("--snapshot", help="A snapshot key in Object Storage (default: newest).")
+    ri_parser.add_argument("--from-file", help="A local snapshot file instead.")
+    ri_parser.add_argument("--show", action="store_true", help="Only print what the snapshot holds.")
+    ri_parser.add_argument("--with-members", action="store_true",
+                           help="group: also add back members that exist and aren't in another group.")
+
+    bp_parser = subparsers.add_parser(
+        "bucket-protection",
+        help="Show or turn on versioning for the backup bucket (an overwritten or deleted backup "
+        "stays recoverable for 30 days), list an object's versions, or bring one back.",
+    )
+    bp_parser.add_argument("--enable", action="store_true")
+    bp_parser.add_argument("--key", help="An object key, e.g. full-backups/instances-continuous.db")
+    bp_parser.add_argument("--restore-version", metavar="VERSION_ID",
+                           help="Make this version of --key the current one again.")
+
+    release_parser = subparsers.add_parser(
+        "release-backup",
+        help="Save a copy of this installed release (code, dashboard, and every dependency as a "
+        "wheel) to Object Storage, so a new host can be installed without GitHub or PyPI. Done "
+        "automatically when the code changes.",
+    )
+    release_parser.add_argument("--force", action="store_true", help="Upload even if unchanged.")
+    release_parser.add_argument("--output", help="Write the archive to this local file instead.")
+
+    pending_parser = subparsers.add_parser(
+        "pending-deletions",
+        help="List offboarded nodes and deleted backups waiting out their grace period; "
+        "recover one, or delete it now.",
+    )
+    pending_action = pending_parser.add_mutually_exclusive_group()
+    pending_action.add_argument("--recover", type=int, metavar="ID",
+                                help="Cancel this deletion and bring the node (or backup) back.")
+    pending_action.add_argument("--delete-now", type=int, metavar="ID",
+                                help="Carry out this deletion now instead of waiting.")
+    pending_parser.add_argument("--all", action="store_true",
+                                help="Also list deletions already carried out or recovered.")
+    pending_parser.add_argument("--json", action="store_true")
+    pending_parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
 
     migrate_resume_parser = subparsers.add_parser(
         "migrate-resume",
@@ -13968,6 +15804,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "Destroys real data -- omit to keep the volumes (untagged, so `rebuild` won't find them).",
     )
     offboard_parser.add_argument("--yes", action="store_true", help="Skip the interactive confirmation prompt.")
+    offboard_parser.add_argument(
+        "--now", action="store_true",
+        help="Carry out the deletion at once instead of holding it for the grace period "
+        f"(default {DELETION_GRACE_DAYS} days, LIS_DELETION_GRACE_DAYS) during which it can be "
+        "recovered.")
 
     poll_parser = subparsers.add_parser(
         "poll",
@@ -14650,6 +16491,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _dispatch(args) -> int:
 
+    read_only = (args.command == "pending-deletions" and getattr(args, "recover", None) is None
+                 and getattr(args, "delete_now", None) is None)
+    refusal = standby_refusal(args.command, read_only=read_only)
+    if refusal is not None:
+        print(f"Refused: {refusal}", file=sys.stderr)
+        return 1
     try:
         return _route(args)
     except engine.ConfigError as e:
@@ -14708,6 +16555,12 @@ def _route(args) -> int:
         return cmd_deregister(args)
     if args.command == "backup-list":
         return cmd_backup_list(args)
+    if args.command == "release-backup":
+        return cmd_release_backup(args)
+    if args.command == "bucket-protection":
+        return cmd_bucket_protection(args)
+    if args.command == "pending-deletions" and args.recover is None and args.delete_now is None:
+        return cmd_pending_deletions(None, args)
     if args.command == "console-session-delete":
         return cmd_console_session_delete(args)
     if args.command == "backup-config":
@@ -14792,6 +16645,18 @@ def _route(args) -> int:
         return cmd_rollback(client, args)
     if args.command == "backup-delete":
         return cmd_backup_delete(client, args)
+    if args.command == "pending-deletions":
+        return cmd_pending_deletions(client, args)
+    if args.command == "recovery-drill":
+        return cmd_recovery_drill(client, args)
+    if args.command == "recovery-drill-check":
+        return cmd_recovery_drill_check(client, args)
+    if args.command == "rotate-credentials":
+        return cmd_rotate_credentials(client, args)
+    if args.command == "restore-item":
+        if args.show:
+            return cmd_restore_item(None, args)
+        return cmd_restore_item(client, args)
     if args.command == "heal":
         return cmd_heal(client, args)
     if args.command == "host-watchdog":

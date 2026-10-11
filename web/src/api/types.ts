@@ -122,8 +122,9 @@ export interface OnboardResult {
   warnings?: string[]
 }
 export interface OffboardResult {
-  outcome: 'aborted_by_user' | 'incomplete' | 'offboarded'
+  outcome: 'aborted_by_user' | 'incomplete' | 'offboarded' | 'pending_deletion'
   detail: string | null
+  pending_deletion?: PendingDeletion | null
   warnings?: string[]
 }
 export interface DeregisterResult {
@@ -243,33 +244,7 @@ export interface HookRunResult {
   attempts: number
 }
 export type ApiTokenBundle = 'read' | 'operate' | 'configure' | 'admin'
-export type ApiTokenOperation =
-  | 'instances:list'
-  | 'instances:status'
-  | 'instances:history'
-  | 'savings:read'
-  | 'activity:read'
-  | 'instances:start'
-  | 'instances:stop'
-  | 'instances:extend'
-  | 'groups:start'
-  | 'groups:stop'
-  | 'schedules:read'
-  | 'schedules:write'
-  | 'groups:read'
-  | 'groups:write'
-  | 'groups:membership'
-  | 'dependencies:write'
-  | 'mode:write'
-  | 'hooks:read'
-  | 'hooks:write'
-  | 'hooks:run'
-  | 'instances:onboard'
-  | 'instances:migrate'
-  | 'instances:offboard'
-  | 'instances:vpc-address'
-  | 'tokens:manage'
-  | 'logs:read'
+export type ApiTokenOperation = string
 export type ApiTokenScope = ApiTokenBundle | ApiTokenOperation
 export interface ApiToken {
   name: string
@@ -399,8 +374,36 @@ export interface RollbackResult {
   warnings: string[]
 }
 export interface BackupDeleteResult {
-  outcome: 'deleted' | 'forgotten' | 'aborted_by_user' | 'incomplete'
+  outcome: 'deleted' | 'forgotten' | 'aborted_by_user' | 'incomplete' | 'pending_deletion'
   problems: string[]
+  pending_deletion?: PendingDeletion | null
+}
+export interface PendingResource {
+  type: 'volume' | 'ip' | 'instance'
+  id: number | string
+  role: 'os' | 'data' | 'ip' | 'backup'
+  action: 'delete' | 'untag'
+  outcome?: string
+}
+export interface PendingDeletion {
+  id: number
+  name: string
+  kind: 'node' | 'migration_backup'
+  status: 'pending' | 'deleted' | 'recovered' | 'failed'
+  created_at: string
+  due_at: string
+  resources: PendingResource[]
+  detail: string | null
+  updated_at: string
+  bundle?: {
+    group?: string | null
+    schedule?: unknown
+    delete_volumes?: boolean
+  } | null
+}
+export interface PendingDeletionsResponse {
+  grace_days: number
+  entries: PendingDeletion[]
 }
 export interface SystemBackupStatus {
   object_storage: {
@@ -534,4 +537,25 @@ export interface AccountHolidaySetting {
   own: 'follow' | 'ignore' | null
   effective: 'follow' | 'ignore'
   source: 'instance' | 'group' | 'default'
+}
+export interface RestoreItemRequest {
+  kind: 'schedule' | 'hooks' | 'group'
+  name: string
+  snapshot?: string | null
+  with_members?: boolean
+}
+export interface RestoreItemResult {
+  kind: string
+  name: string
+  restored: unknown
+  applied: string[]
+  problems: string[]
+  warnings?: string[]
+}
+export interface TokenScopeCatalog {
+  bundles: Record<string, string[]>
+  operations: {
+    value: string
+    description: string
+  }[]
 }

@@ -86,8 +86,9 @@ RUN groupadd --gid 1000 scheduler \
 
 WORKDIR /app
 
-COPY requirements.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Exact versions, each checked against its published hash.
+COPY requirements.lock requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 # An explicit file list here, not a whole-directory copy -- the source tree this is built
 # from also carries test files and dev-only tooling with no reason to be in a production

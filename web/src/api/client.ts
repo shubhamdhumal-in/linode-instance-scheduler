@@ -44,6 +44,11 @@ import type {
   ConsoleRun,
   LogsIndex,
   LogTail,
+  PendingDeletion,
+  PendingDeletionsResponse,
+  RestoreItemRequest,
+  TokenScopeCatalog,
+  RestoreItemResult,
 } from './types'
 export class ApiError extends Error {
   status: number
@@ -375,7 +380,38 @@ export const api = {
     }>('DELETE', `/backups/${encodeURIComponent(name)}`)
     return pollOperation<BackupDeleteResult>(kickoff.operation_id, onProgress)
   },
+  listPendingDeletions: (includeDone = false) =>
+    request<PendingDeletionsResponse>('GET', `/pending-deletions${includeDone ? '?include_done=true' : ''}`),
+  recoverPendingDeletion: async (
+    id: number,
+    onProgress?: (percent: number, currentStep: string | null) => void,
+    onWarning?: (warnings: string[]) => void,
+  ) => {
+    const kickoff = await request<{
+      operation_id: string
+    }>('POST', `/pending-deletions/${id}/recover`)
+    return pollOperation<PendingDeletion>(kickoff.operation_id, onProgress, onWarning)
+  },
+  deletePendingNow: async (
+    id: number,
+    onProgress?: (percent: number, currentStep: string | null) => void,
+  ) => {
+    const kickoff = await request<{
+      operation_id: string
+    }>('POST', `/pending-deletions/${id}/delete-now`)
+    return pollOperation<PendingDeletion>(kickoff.operation_id, onProgress)
+  },
   getSystemBackup: () => request<SystemBackupStatus>('GET', '/system/backup'),
+  listSnapshots: () =>
+    request<{
+      snapshots: string[]
+    }>('GET', '/system/snapshots'),
+  previewRestoreItem: (body: RestoreItemRequest) =>
+    request<{
+      snapshot: unknown
+      current: unknown
+    }>('POST', '/system/restore-item/preview', body),
+  restoreItem: (body: RestoreItemRequest) => request<RestoreItemResult>('POST', '/system/restore-item', body),
   configureSystemBackup: (body: {
     bucket: string
     endpoint: string
@@ -464,6 +500,7 @@ export const api = {
       warnings?: string[]
     }>('PATCH', `/instances/${encodeURIComponent(name)}`, { schedule_mode: mode }),
   listTokens: () => request<ApiToken[]>('GET', '/tokens'),
+  tokenScopes: () => request<TokenScopeCatalog>('GET', '/tokens/scopes'),
   createToken: (body: {
     name: string
     scopes: ApiTokenScope[]

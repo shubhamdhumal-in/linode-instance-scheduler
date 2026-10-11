@@ -4,6 +4,7 @@ import { Navigate, Route, HashRouter as Router, Routes } from 'react-router-dom'
 import { cancelBackgroundPolling, resetBackgroundPollingCancellation } from './api/client'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import { ActivityPage } from './pages/ActivityPage'
+import { PendingDeletionsPage } from './pages/PendingDeletionsPage'
 import { BackupsPage } from './pages/BackupsPage'
 import { ConsolePage } from './pages/ConsolePage'
 import { DashboardLayout } from './pages/DashboardLayout'
@@ -48,6 +49,7 @@ function AppRoutes() {
         <Route path="/tokens" element={<TokensPage />} />
         <Route path="/holidays" element={<HolidaysPage />} />
         <Route path="/backups" element={<BackupsPage />} />
+        <Route path="/pending-deletions" element={<PendingDeletionsPage />} />
         <Route path="/system-backup" element={<SystemBackupPage />} />
         <Route path="/activity" element={<ActivityPage />} />
         <Route path="/logs" element={<LogsPage />} />

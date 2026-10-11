@@ -260,7 +260,7 @@ Every command below is run from the repository root, with the virtual environmen
 |---|---|
 | `migrate-start` | **One-time, only for a node whose OS is still on local disk.** Starts moving it onto Block Storage — creates the destination volume and boots the node into Rescue Mode. Prints one manual command for you to run. |
 | `console-session-delete` | Delete a migration's Rescue Mode console session log (removed automatically after the retention period). See §6.6. |
-| `rollback` / `backup-list` / `backup-delete` | Put the original system back from the backup `migrate-start --backup` kept, list backups, or delete one when you no longer need it. See §6.5. |
+| `rollback` / `backup-list` / `backup-delete` | Put the original system back from the backup `migrate-start --backup` kept, list backups, or delete one when you no longer need it (held for a grace period first, see `pending-deletions`). See §6.5. |
 | `migrate-resume` | Finishes what `migrate-start` began, after you've run that one manual command. Boots the node from its new Block Storage volume and reserves its IP. |
 | `migrate-copy` | Optional: runs the copy step for you in the Rescue Mode console, then `migrate-resume`. Only when a pre-migration backup is kept (§6.6). |
 | `migrate-orphans` | Lists (or `--cleanup`s) destination volumes left behind by a `migrate-start --force` restart — see §6.4. You'll rarely need this. |
@@ -307,7 +307,13 @@ Every command below is run from the repository root, with the virtual environmen
 | `backup-config` | Shows where this tool backs itself up and how the last backup went; sets, tests or removes the Object Storage settings. See §8.10. |
 | `restore` | On a replacement host: puts the newest (or a chosen, or a local) database snapshot in place, plus the trusted host keys. Run `rebuild` afterward. See §8.10. |
 | `ssh-key-protect` / `ssh-key-restore` | The deployment SSH key is kept recoverable automatically (encrypted in the database and Object Storage, public half in your Linode profile, passphrase in your Linode account); `ssh-key-protect` checks it now, `ssh-key-restore` gets it back on a replacement host. See §8.10. (`ssh-key-backup` stores an extra copy under a passphrase you choose.) |
-| `offboard` | Permanently decommission a stopped node — releases its reserved IP, removes it from tracking, and optionally deletes its volumes. For when you're actually done with a node, not just pausing it. |
+| `offboard` | Permanently decommission a stopped node — releases its reserved IP, removes it from tracking, and optionally deletes its volumes. For when you're actually done with a node, not just pausing it. The deletion waits out a grace period (7 days by default) during which the node can be recovered; `--now` skips it. |
+| `pending-deletions` | Lists offboarded nodes and deleted backups waiting out their grace period; `--recover ID` brings one back, `--delete-now ID` deletes it at once. See §8. |
+| `restore-item` | Puts back one node's schedule or hooks, or one group, as it was in a database snapshot — without restoring the whole database. See §8.10. |
+| `release-backup` | Saves a copy of the installed release (code, built dashboard, every dependency) to Object Storage, so a new host can be installed without GitHub or PyPI. Done automatically when the code changes. See §8.10. |
+| `bucket-protection` | Shows or turns on versioning for the backup bucket (turned on automatically), lists an object's versions, or brings an older one back. See §8.10. |
+| `rotate-credentials` | Replaces a credential — the Linode API token, the Object Storage key, the dashboard OAuth secret, or the deployment SSH key on every node. See §8.15. |
+| `recovery-drill` | Proves a new host could take over: a throwaway VM installs the release copy and the latest snapshot, checks everything would work, and is deleted. See §8.15. |
 | `set-vpc-address` | Gives a stopped node's VPC interface a different address, used from its next start — for when another instance took its address while it was stopped. |
 | `deregister` | Admin escape hatch — removes a node from local tracking only, with no changes to the real Linode instance, volumes, or reserved IP at all. For correcting a wrong or unsafe local record, not for decommissioning a real node (use `offboard` for that). |
 
@@ -576,9 +582,12 @@ python instance_manager.py backup-list
 python instance_manager.py backup-delete --name web-1
 ```
 
-`backup-delete` permanently deletes the clone and its cloned volumes (each only after re-checking it
-still carries this backup's tag). For a backup that has already been rolled back to, it only
-removes the record -- that instance is your running system. In the dashboard, the same actions are
+`backup-delete` deletes the clone and its cloned volumes after a grace period (7 days by default,
+`LIS_DELETION_GRACE_DAYS`): until then they stay as they are, marked pending deletion, and
+`pending-deletions --recover ID` keeps the backup after all (see `offboard` in §8). The deletion
+re-checks that each resource still carries this backup's tag. `backup-delete --now` deletes at once.
+For a backup that has already been rolled back to, it only removes the record -- that instance is
+your running system. In the dashboard, the same actions are
 on the **Backups** page; the migration wizard offers "Keep a backup of the original first" on its
 confirmation step.
 
@@ -1049,8 +1058,20 @@ By default, this:
   them for a node that still needs recovering.
 - **Removes the node from your local registry.**
 
-You'll be asked to type the node's name to confirm before anything happens — this is a
-one-way action, not something a stray `y` at a prompt should be able to trigger by accident.
+You'll be asked to type the node's name to confirm before anything happens — not something a
+stray `y` at a prompt should be able to trigger by accident.
+
+**Nothing is deleted at once.** The node leaves management immediately, but its reserved IP and
+volumes are held for a grace period — 7 days by default (`LIS_DELETION_GRACE_DAYS`; `0` deletes at
+once). During that time every resource keeps all of its tags (ownership, schedule, group, hooks)
+plus three more marking it pending: `lis-pending-delete:<date>` (or `lis-pending-untag:<date>` on a
+volume that will be kept) and `lis-pending-of:<name>`. When it's due, the active scheduler does the
+deletion, re-checking each resource first: anything no longer marked, now attached or assigned to an
+instance, or claimed by another name is left alone. To skip the grace period:
+
+```
+python instance_manager.py offboard --name redis-standby-1 --now
+```
 
 **To also permanently delete the volumes**, not just release the IP:
 
@@ -1062,6 +1083,28 @@ This destroys the actual data on those volumes — irreversibly. Only use it onc
 you'll never need that data again. The default (no `--delete-volumes`) is deliberately the
 safer choice: you can always delete volumes manually later via Cloud Manager once you're sure,
 but you can't undo a deletion.
+
+### `pending-deletions` — changing your mind after `offboard` or `backup-delete`
+
+```
+python instance_manager.py pending-deletions                  # what's waiting, and when it's due
+python instance_manager.py pending-deletions --all            # also ones carried out or recovered
+python instance_manager.py pending-deletions --recover 4      # cancel it
+python instance_manager.py pending-deletions --delete-now 4   # delete it now (asks you to type the name)
+```
+
+Recovering an offboarded node brings it back **stopped**, exactly as it was: its schedule, group
+membership, hooks, manual-only mode and holiday setting. `start` it as usual. Recovering a backup
+simply keeps it again. `--delete-now` can't be undone; `--yes` skips typing the name. The
+dashboard's **Pending deletion** page does the same, and the notice shown after offboarding links to
+it. Over the API: `GET /pending-deletions`, `POST /pending-deletions/{id}/recover` and
+`POST /pending-deletions/{id}/delete-now`.
+
+While a name is pending deletion, `onboard` refuses that name — recover it, delete it now, or use
+another name.
+A pending node survives the loss of the scheduler's database: `rebuild` restores it as a pending
+deletion (from Object Storage, or from its tags alone), never as a live node. An alert is sent if a
+pending deletion is overdue or keeps failing.
 
 ### `deregister` — admin escape hatch for a wrong or unsafe local record
 
@@ -1505,11 +1548,13 @@ printed copy command identifies the two disks itself and refuses if it can't, §
 instance with its current status; a per-instance detail page for start/stop/extend, viewing and
 editing its individual schedule, its scheduled-vs-actual savings percentages, its recent event
 history, and two distinct one-way actions in its own separate cards — **Offboard** (permanently
-decommissions the node on Linode too — releases the reserved IP, optionally deletes volumes, see
-the `offboard` CLI section above) and **Remove from tracking** (the `deregister` CLI command's
+decommissions the node on Linode too, after the grace period — releases the reserved IP,
+optionally deletes volumes, see the `offboard` CLI section above) and **Remove from tracking** (the `deregister` CLI command's
 dashboard equivalent — removes local tracking only, never touches the node itself, for a record
-that's simply wrong rather than a node you're actually done with); a group list and per-group
-detail page for the same schedule/savings view plus membership management. It's a thin client
+that's simply wrong rather than a node you're actually done with); a **Pending deletion** page
+listing offboarded nodes and deleted backups still inside their grace period, each with **Recover**
+and **Delete now** (after typing the name); a group list and per-group detail page for the same
+schedule/savings view plus membership management. It's a thin client
 over the REST API in §8.8 — every action it takes is one of that API's own endpoints, nothing the
 dashboard can do that the CLI/API couldn't already do directly.
 
@@ -1647,6 +1692,73 @@ python instance_manager.py schedule-catch-up  # nodes left off their schedule by
 `--force`, which moves it aside rather than deleting it. A snapshot from an older version is
 upgraded automatically. `rebuild` also finds a node whose tags were removed, through its Object
 Storage record.
+
+**Putting back one thing, not the whole database (`restore-item`).** If one node's schedule or
+hooks, or one group, was changed or deleted by mistake, bring just that item back from a snapshot:
+
+```
+python instance_manager.py restore-item schedule --name web-1 --show        # what the newest snapshot holds
+python instance_manager.py restore-item schedule --name web-1               # put it back
+python instance_manager.py restore-item hooks --name db-1 --snapshot full-backups/<key>.db
+python instance_manager.py restore-item group --name dev --with-members     # also re-add its members
+python instance_manager.py restore-item group --name dev --from-file /var/backups/instance-scheduler/<file>.db
+```
+
+The newest snapshot in Object Storage is used unless you name one (`restore --list` lists them) or
+give a local file. A schedule or hooks need the node onboarded now. A group is created if it no
+longer exists, with its schedule, holiday setting, hooks and start order from the snapshot (a
+start-order target that no longer exists is skipped and reported); `--with-members` also adds back
+members that exist and aren't in another group. On the dashboard: **System backup → Restore one item
+from a snapshot**, which shows the snapshot's version next to what's there now before restoring.
+Over the API: `GET /system/snapshots`, `POST /system/restore-item/preview` and
+`POST /system/restore-item` with `{"kind", "name", "snapshot", "with_members"}`.
+
+**A copy of the release in your bucket (`release-backup`).** Installing on a new host normally
+downloads this tool from GitHub and its dependencies from PyPI (and Node.js to build the dashboard).
+So that a recovery doesn't depend on any of those being reachable, the scheduler keeps a copy of the
+installed release in your bucket: the code, the built dashboard, `requirements.lock`, and a wheel of
+every dependency for this host's platform, at `deployment/release/<version>.tar.gz` and
+`deployment/release/latest.tar.gz`. It's uploaded whenever the installed code changes, and again if
+it's been removed from the bucket. To upload now:
+
+```
+python instance_manager.py release-backup                  # if anything changed
+python instance_manager.py release-backup --force          # even if unchanged
+python instance_manager.py release-backup --output /tmp/release.tar.gz   # a local file instead
+```
+
+Over the API: `GET /system/release-copy` (status) and `POST /system/release-copy` (`?force=true`).
+
+To use it on a new host, fetch it with any S3 tool and your bucket's access keys, extract it, and
+run the installer from inside it — nothing is downloaded from GitHub, PyPI or nodejs.org (if the
+bundled wheels don't fit the new host's platform or Python, dependencies come from PyPI instead):
+
+```
+aws s3 cp s3://<bucket>/deployment/release/latest.tar.gz . --endpoint-url https://<region>.linodeobjects.com
+tar xzf latest.tar.gz
+cd linode-instance-scheduler && sudo ./install.sh recover
+```
+
+**Bucket versioning.** When backups are configured, versioning is turned on for the bucket, with a
+lifecycle rule that removes old versions 30 days after they were overwritten or deleted (any other
+lifecycle rules on the bucket are kept). An overwritten or deleted backup can then be brought back
+within those 30 days. The health check turns it on again if it's found off. The bucket's access key
+needs permission to change bucket settings; if it doesn't, an alert says so.
+
+```
+python instance_manager.py bucket-protection                       # status
+python instance_manager.py bucket-protection --enable              # turn it on now
+python instance_manager.py bucket-protection --key full-backups/instances-continuous.db     # its versions
+python instance_manager.py bucket-protection --key full-backups/instances-continuous.db \
+    --restore-version <VERSION_ID>                                 # make that version current again
+```
+
+Bringing a version back copies it as the newest version, so every version is still kept. Over the
+API: `GET /system/bucket-protection` and `POST /system/bucket-protection` (turn it on).
+
+**Every dependency is pinned by hash.** `requirements.lock` lists each Python package with its
+SHA-256 hashes; `install.sh` and the container image install with `pip --require-hashes`, so a
+host only ever installs exactly the files that were released.
 
 ### 8.11 High availability — why this isn't an always-on active-active or active-passive setup
 
@@ -1888,10 +2000,10 @@ Scopes come in two sizes. The four **bundles** cover common roles:
 
 | Bundle | Allows |
 |---|---|
-| `read` | List, status, history, savings, activity, schedules, groups, hooks (view only) |
-| `operate` | Start, stop, extend, run a hook now, group start/stop |
-| `configure` | Schedules, groups, group membership, start order, manual-only mode, VPC address |
-| `admin` | Everything, including changing hooks (they run as root), onboard/offboard, migration, logs, and managing tokens |
+| `read` | List, status, history, savings, activity, schedules, groups, hooks, pending deletions, snapshots, and backup/system status (view only) — `instances:list`, `instances:status`, `instances:history`, `savings:read`, `activity:read`, `schedules:read`, `groups:read`, `hooks:read`, `deletions:read`, `backups:read`, `system:read` |
+| `operate` | Start, stop, extend, run a hook now, group start/stop, clear a stuck mark, catch up missed schedules, run a backup, save the release copy — `instances:start`, `instances:stop`, `instances:extend`, `groups:start`, `groups:stop`, `hooks:run`, `instances:clear-lock`, `schedules:catch-up`, `system:backup`, `backups:release-copy` |
+| `configure` | Schedules, groups, group membership, start order, manual-only mode, VPC address, recovering a pending deletion, restoring one item, bucket versioning, recovery drills, system settings — `schedules:write`, `groups:write`, `groups:membership`, `dependencies:write`, `mode:write`, `instances:vpc-address`, `deletions:recover`, `backups:restore-item`, `backups:versioning`, `backups:drill`, `system:configure` |
+| `admin` | Everything, including changing hooks (they run as root), onboard/offboard, migration, logs, deleting a pending deletion now, rotating credentials, and managing tokens |
 
 For a token that should do exactly one thing, give it **single operations** instead (or as
 well) — for example a nightly job that may only stop nodes in one group:
@@ -1929,6 +2041,15 @@ python instance_manager.py api-token-create --name nightly-stop --scopes instanc
 | `system:read` | Backup, key-protection, restore-test, lease, watchdog and alert status |
 | `system:backup` | Run a backup, a restore test, the settings backup, key protection |
 | `system:configure` | Heal, take over the scheduler lease, Shutdown Watchdog, the age key for the settings backup |
+| `deletions:read` | List nodes and backups pending deletion |
+| `deletions:recover` | Recover a node or backup pending deletion |
+| `deletions:delete-now` | Carry out a pending deletion now (it can't be recovered afterwards) |
+| `backups:read` | List database snapshots and preview an item in one |
+| `backups:restore-item` | Restore one schedule, a node's hooks, or a group from a snapshot |
+| `backups:release-copy` | Save a copy of the installed release to Object Storage |
+| `backups:versioning` | Turn on bucket versioning, list and bring back object versions |
+| `backups:drill` | Run a recovery drill (creates and deletes a throwaway VM) |
+| `credentials:rotate` | Rotate the Linode API token, bucket keys, OAuth secret or deployment SSH key (admin-level: it replaces credentials) |
 
 Settings that hold credentials -- Object Storage keys, the SMTP password -- can only be changed with
 an `admin` token or a dashboard login.
@@ -1937,7 +2058,10 @@ an `admin` token or a dashboard login.
 needs is refused with `403` naming the missing scope; anything not on this list needs `admin`.
 
 `--instances` and `--groups` limit a token to particular nodes and/or groups (a group covers its
-current members). A limited token only sees those nodes and groups in lists, and can only read
+current members). Manual-only nodes can be included too; the token can then start and stop them
+like any other. On the dashboard's **API tokens** page, nodes and groups are picked from searchable
+lists of what exists, and the operations shown come from the server (`GET /tokens/scopes`), so the
+list always matches this version. A limited token only sees those nodes and groups in lists, and can only read
 operations it started itself. Every action taken with a token is recorded in `history` under
 `token:<name>`. `api-token-list` shows each token's scopes, limits, expiry and when it was last
 used; `api-token-revoke --name ci-deploy` stops it working immediately.
@@ -2057,8 +2181,12 @@ python instance_manager.py alerts-check       # what needs attention now (exit 1
 ```
 
 Alerts also cover a failed daily restore test of the backups, the Linode API token being rejected
-or expiring within 14 days, the disk holding the database nearly full, and Shutdown Watchdog being
-off on the scheduler's host.
+or expiring within 14 days, the disk holding the database nearly full, Shutdown Watchdog being
+off on the scheduler's host, a pending deletion that's overdue or keeps failing, bucket versioning
+that can't be turned on (the access key lacks permission to change bucket settings), a failed or
+missing recovery drill (when drills are turned on), and the host's clock: more than 60 seconds off
+Linode's API time, or the operating system reporting it isn't time-synchronized (fix with
+`timedatectl set-ntp true`). Schedules, leases and backup ages all depend on the clock.
 
 **Setting up email alerts.** On the dashboard's System backup page, fill in the Alerts form: who
 to send to, your SMTP server, port, security, user and password, then **Save** and **Send test
@@ -2088,10 +2216,64 @@ stands by -- it starts, stops and uploads nothing, and alerts. `scheduler-lease`
 active; `scheduler-lease --take-over` (or the System backup page) moves it, only once you're sure
 the other host is gone.
 
+A standby host also refuses changes made on it: its API answers `409` to anything other than a
+read (and the take-over itself), and the CLI refuses commands that would change nodes, schedules
+or settings, pointing at the active host. Two hosts changing the same nodes could undo each other.
+Set `LIS_ALLOW_STANDBY_CHANGES=1` to override (for example while you know the active host is gone
+and you haven't taken over yet). If the bucket can't be reached, the scheduler that was active
+keeps scheduling, and a host that wasn't active stays standby — it can't tell whether the other one
+is still running; `scheduler-lease --take-over` overrides that too.
+
 **Restore testing.** Every day the newest snapshot is downloaded and checked, and the stored key
 copies decrypted, without touching the live database (`backup-verify` on demand). A damaged
 database is never uploaded. Upgrading with `install.sh install` takes a snapshot first, in
 `backups/pre-upgrade-<time>/`.
+
+**Recovery drills.** A restore test checks the backups; a drill checks that a new host could
+actually take over. It creates a throwaway `g6-nanode-1` (tagged `lis-recovery-drill`), copies the
+release copy from your bucket and a minimal `.env` onto it, and runs `install.sh recover --drill`
+there: the latest snapshot and the deployment key are restored, then it checks that every node's
+volumes and reserved IP exist and that running nodes can be reached over SSH with the restored key.
+The drill host is read-only — it takes no lease, doesn't rebuild or heal, uploads nothing and starts
+no services — and the VM is always deleted afterwards. It costs one nanode for about 10–15 minutes.
+
+```
+python instance_manager.py recovery-drill                     # now (this host's region)
+python instance_manager.py recovery-drill --region us-ord     # another region
+python instance_manager.py recovery-drill --keep-vm           # leave the VM to inspect (delete it yourself)
+```
+
+Set `LIS_RECOVERY_DRILL_DAYS=7` and the scheduler runs one weekly; an alert is sent when the last
+drill failed or none ran recently. Over the API: `GET /system/recovery-drill` (the last result) and
+`POST /system/recovery-drill` (run one now).
+
+**Rotating credentials.** If a credential may have leaked, or on your own schedule:
+
+```
+python instance_manager.py rotate-credentials api-token      # the Linode API token
+python instance_manager.py rotate-credentials bucket-key     # the Object Storage access key
+python instance_manager.py rotate-credentials oauth-secret   # the dashboard's OAuth client secret
+python instance_manager.py rotate-credentials ssh-key        # the deployment SSH key on every node
+python instance_manager.py rotate-credentials ssh-key --continue   # move nodes not yet moved
+```
+
+- `api-token`: a new token with the same scopes (and the same lifetime, if the old one expires) is
+  written to `.env` and picked up by the running services without a restart; the old token is
+  revoked only after the scheduler has switched to the new one.
+- `bucket-key`: a new key with the same bucket access is created and tested, written to `.env`,
+  then the old key is deleted.
+- `oauth-secret`: the secret is reset and the new one written to `.env`; the old one stops working
+  at once.
+- `ssh-key`: a new deployment key is made. The old one is kept — encrypted in the database and the
+  bucket, and offered by every SSH connection alongside the new one (`LINODE_SSH_PREVIOUS_KEY_PATH`)
+  — until every node trusts the new key. Running nodes move at once: the new key is added, a login
+  with only the new key is proven, then the old key is removed. Stopped nodes move after their next
+  start; the scheduler does this, or run `--continue`. If you restore onto a new host part way
+  through, `ssh-key-restore` brings back the previous key too. If you use the assisted migration
+  copy (§6.6), add the new public key to your profile's Lish keys yourself afterwards.
+
+Over the API: `POST /system/credentials/rotate` with `{"kind": "ssh-key", "continue_rotation":
+false}`, and `GET /system/credentials/rotation` for a key rotation's progress.
 
 ## 9. Costs
 

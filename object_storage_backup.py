@@ -426,6 +426,26 @@ def upload_deployment_file(
     return key
 
 
+def deployment_file_exists(name: str) -> bool | None:
+
+    client = build_object_storage_client()
+    if client is None:
+        return None
+    try:
+        _retry(lambda: client.head_object(Bucket=_cached_bucket, Key=f"{_DEPLOYMENT_PREFIX}{name}"))
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return False
+        return None
+    except BotoCoreError:
+        return None
+
+
+def delete_deployment_file(name: str) -> None:
+    _delete_record(f"{_DEPLOYMENT_PREFIX}{name}")
+
+
 def download_deployment_file(name: str) -> bytes | None:
 
     client = build_object_storage_client()
@@ -635,6 +655,128 @@ def delete_migration_backup(name: str) -> None:
 
 def list_migration_backups() -> list[str] | None:
     return _list_record_names(_MIGRATION_BACKUP_PREFIX)
+
+
+LIFECYCLE_RULE_ID = "lis-expire-old-versions"
+NONCURRENT_VERSION_DAYS = 30
+
+
+def bucket_protection_status() -> dict:
+
+    client = build_object_storage_client()
+    if client is None:
+        return {"versioning": None, "lifecycle": None, "error": "not configured"}
+    out: dict = {"versioning": "Off", "lifecycle": False, "error": None}
+    try:
+        out["versioning"] = _retry(lambda: client.get_bucket_versioning(
+            Bucket=_cached_bucket)).get("Status") or "Off"
+    except (ClientError, BotoCoreError) as e:
+        out["error"] = f"couldn't read versioning: {e}"
+        return out
+    try:
+        rules = _retry(lambda: client.get_bucket_lifecycle_configuration(
+            Bucket=_cached_bucket)).get("Rules", [])
+        out["lifecycle"] = any(r.get("ID") == LIFECYCLE_RULE_ID for r in rules)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "NoSuchLifecycleConfiguration":
+            out["error"] = f"couldn't read the lifecycle rules: {e}"
+    except BotoCoreError as e:
+        out["error"] = f"couldn't read the lifecycle rules: {e}"
+    return out
+
+
+def enable_bucket_protection(days: int = NONCURRENT_VERSION_DAYS) -> dict:
+
+    client = build_object_storage_client()
+    if client is None:
+        raise ObjectStorageError("Object Storage is not configured (LINODE_OBJ_STORAGE_* unset)")
+    bucket = _cached_bucket
+    _retry(lambda: client.put_bucket_versioning(
+        Bucket=bucket, VersioningConfiguration={"Status": "Enabled"}))
+    try:
+        rules = _retry(lambda: client.get_bucket_lifecycle_configuration(Bucket=bucket)).get("Rules", [])
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "NoSuchLifecycleConfiguration":
+            raise
+        rules = []
+    rules = [r for r in rules if r.get("ID") != LIFECYCLE_RULE_ID]
+    rules.append({
+        "ID": LIFECYCLE_RULE_ID, "Status": "Enabled", "Filter": {"Prefix": ""},
+        "NoncurrentVersionExpiration": {"NoncurrentDays": days},
+        "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7},
+    })
+    _retry(lambda: client.put_bucket_lifecycle_configuration(
+        Bucket=bucket, LifecycleConfiguration={"Rules": rules}))
+    return bucket_protection_status()
+
+
+def list_object_versions(key: str) -> list[dict]:
+
+    client = build_object_storage_client()
+    if client is None:
+        raise ObjectStorageError("Object Storage is not configured (LINODE_OBJ_STORAGE_* unset)")
+    page = _retry(lambda: client.list_object_versions(Bucket=_cached_bucket, Prefix=key))
+    out = []
+    for v in page.get("Versions", []) or []:
+        if v.get("Key") == key:
+            out.append({"version_id": v.get("VersionId"), "last_modified": v.get("LastModified"),
+                        "size": v.get("Size"), "latest": bool(v.get("IsLatest")), "deleted": False})
+    for m in page.get("DeleteMarkers", []) or []:
+        if m.get("Key") == key:
+            out.append({"version_id": m.get("VersionId"), "last_modified": m.get("LastModified"),
+                        "size": 0, "latest": bool(m.get("IsLatest")), "deleted": True})
+    out.sort(key=lambda v: v["last_modified"] or 0, reverse=True)
+    return out
+
+
+def restore_object_version(key: str, version_id: str) -> None:
+
+    client = build_object_storage_client()
+    if client is None:
+        raise ObjectStorageError("Object Storage is not configured (LINODE_OBJ_STORAGE_* unset)")
+    bucket = _cached_bucket
+    _retry(lambda: client.copy_object(
+        Bucket=bucket, Key=key, CopySource={"Bucket": bucket, "Key": key, "VersionId": version_id},
+        MetadataDirective="COPY"))
+
+
+_PENDING_PREFIX = "pending-deletions/"
+
+
+def _pending_key(kind: str, name: str) -> str:
+    return f"{_PENDING_PREFIX}{kind}--{name}.json"
+
+
+def upload_pending_deletion(kind: str, name: str, record: dict, *,
+                            attempts: int = DEFAULT_ATTEMPTS,
+                            delay_s: float = DEFAULT_DELAY_S) -> None:
+    _upload_record(_pending_key(kind, name), f"pending deletion of '{name}'", record,
+                   attempts=attempts, delay_s=delay_s)
+
+
+def download_pending_deletion(kind: str, name: str) -> dict | None:
+    return _download_record(_pending_key(kind, name))
+
+
+def delete_pending_deletion(kind: str, name: str) -> None:
+    _delete_record(_pending_key(kind, name))
+
+
+def list_pending_deletions() -> list[tuple[str, str]] | None:
+
+    names = _list_record_names(_PENDING_PREFIX)
+    if names is None:
+        return None
+    out = []
+    for key in names:
+        kind, sep, name = key.partition("--")
+        if sep:
+            out.append((kind, name))
+    return out
+
+
+def delete_instance_backup(name: str) -> None:
+    _delete_record(_object_key(name))
 
 
 _HOLIDAYS_KEY = "holidays/all.json"

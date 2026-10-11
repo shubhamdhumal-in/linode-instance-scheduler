@@ -41,8 +41,11 @@ git clone https://github.com/sandipgangdhar/linode-instance-scheduler.git
 cd linode-instance-scheduler/spike
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 ```
+
+`requirements.lock` pins every dependency with its SHA-256 hashes; `--require-hashes` makes `pip`
+refuse anything that isn't exactly what was released.
 
 Configuration is one flat file, `.env`, read once at process startup:
 
@@ -211,6 +214,10 @@ in real values — never commit the real file).
 | `LIS_BACKUP_KEEP_ALL_HOURS` / `LIS_BACKUP_KEEP_DAILY_DAYS` | No (48 / 30) | Pruning of old database snapshots in Object Storage: everything from the last N hours, then one a day for N days. |
 | `LIS_ALERT_WEBHOOK_URL` | No | Alerts as a JSON POST (Slack/Teams incoming webhooks accept it). See "Alerts" below. |
 | `LIS_ALERT_EMAIL_TO`, `LIS_ALERT_SMTP_HOST`, `LIS_ALERT_SMTP_PORT`, `LIS_ALERT_SMTP_SECURITY`, `LIS_ALERT_SMTP_USER`, `LIS_ALERT_SMTP_PASSWORD`, `LIS_ALERT_EMAIL_FROM` | No | Alerts by email over SMTP (port 587 with starttls by default). Linode blocks outbound SMTP ports on new accounts until support opens them. |
+| `LIS_DELETION_GRACE_DAYS` | No (default 7) | Days `offboard` and `backup-delete` keep resources, recoverable, before deleting them. `0` deletes at once. See "Offboarding and pending deletions" below. |
+| `LIS_RECOVERY_DRILL_DAYS` | No (off) | Run a recovery drill every N days (e.g. `7`). See "Recovery drills" below. |
+| `LIS_ALLOW_STANDBY_CHANGES` | No | `1` lets a standby host (another scheduler holds the lease) make changes anyway. Normally left unset. |
+| `LINODE_SSH_PREVIOUS_KEY_PATH` | Set automatically | During a deployment SSH key rotation, the previous key, offered alongside the new one until every node has moved. Removed when the rotation finishes; don't set it by hand. |
 
 ## Backup & recovery
 
@@ -387,6 +394,18 @@ public key set (`LIS_ENV_BACKUP_RECIPIENTS`), the bucket also holds your own enc
 `.env` and the SSH key; `sudo ./install.sh recover --env-from-backup --age-identity key.txt` then
 asks only for the bucket settings.
 
+The bucket also holds a copy of the installed release (`deployment/release/latest.tar.gz`: code,
+built dashboard, `requirements.lock` and every dependency as a wheel), uploaded whenever the code
+changes. If GitHub, PyPI or nodejs.org can't be reached, fetch it with any S3 tool using the bucket
+keys, extract it, and run `sudo ./install.sh recover` from inside it:
+
+```bash
+aws s3 cp s3://<bucket>/deployment/release/latest.tar.gz . --endpoint-url https://<region>.linodeobjects.com
+tar xzf latest.tar.gz && cd linode-instance-scheduler && sudo ./install.sh recover
+```
+
+`release-backup` uploads it now (`--force` even if unchanged, `--output FILE` for a local copy).
+
 ### Self-healing and missed schedules
 
 The scheduler compares every node with the account every five minutes (`heal` does it on demand):
@@ -406,7 +425,10 @@ With a webhook and/or email set up (the System backup page's Alerts form, `alert
 the deployment SSH key isn't stored in every place, or nodes stay off their schedule — again every
 6 hours while it lasts, and once when resolved. Also covered: a failed daily restore test, the API
 token rejected or expiring within 14 days, the database disk nearly full, Shutdown Watchdog off on
-this host, and this host standing by because another scheduler holds the lease. `alerts-test`
+this host, this host standing by because another scheduler holds the lease, a pending deletion
+overdue or failing, bucket versioning that can't be turned on, a failed or missing recovery drill
+(when drills are on), and the host clock more than 60 seconds off Linode's API time or not
+time-synchronized (`timedatectl set-ntp true`). `alerts-test`
 sends a test message; `alerts-check` prints what needs attention and exits 1 if anything, for your
 own monitoring. For the whole host being gone: Shutdown Watchdog (`host-watchdog --enable`, done by
 `install.sh`) boots it again after a crash, and `LIS_HEARTBEAT_URL` lets an uptime monitor notice
@@ -420,6 +442,69 @@ takes the lease over at once, and `scheduler-lease --take-over` moves it by hand
 newest snapshot is downloaded and checked and the key copies decrypted (`backup-verify` on demand);
 a database that fails SQLite's integrity check is never uploaded. An upgrade with `install.sh
 install` takes a snapshot first, in `backups/pre-upgrade-<time>/`.
+
+A standby host refuses changes: its API answers `409` to anything but reads (and the take-over),
+and the CLI refuses changing commands, naming the active host. Make changes there, or take over if
+it's gone. `LIS_ALLOW_STANDBY_CHANGES=1` overrides. While the bucket can't be reached, the
+scheduler that was active carries on and a host that wasn't active stays standby;
+`scheduler-lease --take-over` overrides.
+
+### Recovery drills
+
+`recovery-drill` proves a new host could take over: it creates a throwaway `g6-nanode-1` (tagged
+`lis-recovery-drill`; `--region` to choose), installs the release copy from the bucket with a
+minimal `.env`, and runs `install.sh recover --drill`, which restores the latest snapshot and the
+SSH key and then checks every node's volumes and reserved IP exist and running nodes answer over SSH
+with the restored key. The drill host is read-only — no lease, no rebuild or heal, no uploads, no
+services — and the VM is always deleted (`--keep-vm` to inspect it, then delete it yourself). About
+10–15 minutes of a nanode per drill. `LIS_RECOVERY_DRILL_DAYS=7` runs one weekly from the
+scheduler; a failed or missing drill is alerted.
+
+### Bucket versioning
+
+Versioning is turned on for the backup bucket when backups are configured (and again by the health
+check if it's found off), with a lifecycle rule expiring old versions after 30 days; other
+lifecycle rules are kept. The access key needs permission to change bucket settings, otherwise an
+alert says so.
+
+```bash
+python instance_manager.py bucket-protection                       # status (--enable to turn it on)
+python instance_manager.py bucket-protection --key full-backups/instances-continuous.db       # versions
+python instance_manager.py bucket-protection --key full-backups/instances-continuous.db --restore-version <VERSION_ID>
+```
+
+### Restoring one item from a snapshot
+
+To undo a mistaken change to one node's schedule or hooks, or to one group, without restoring the
+whole database:
+
+```bash
+python instance_manager.py restore-item schedule --name web-1 --show   # look first
+python instance_manager.py restore-item schedule --name web-1          # from the newest snapshot
+python instance_manager.py restore-item group --name dev --with-members --snapshot <key>
+```
+
+`--from-file PATH` uses a local snapshot. The dashboard's System backup page has **Restore one item
+from a snapshot**, which shows the snapshot's version next to the current one first.
+
+### Offboarding and pending deletions
+
+`offboard` and `backup-delete` hold their resources for a grace period (`LIS_DELETION_GRACE_DAYS`,
+default 7) before deleting anything. The resources keep all their tags plus
+`lis-pending-delete:<date>` / `lis-pending-untag:<date>` and `lis-pending-of:<name>`; when due, the
+active scheduler carries out the deletion, re-checking each resource (anything no longer marked,
+attached or assigned, or claimed by another name is left alone). `--now` on either command skips the
+grace period.
+
+```bash
+python instance_manager.py pending-deletions                 # what's waiting (--all for history, --json)
+python instance_manager.py pending-deletions --recover 4     # back, stopped, with schedule, group, hooks, mode, holidays
+python instance_manager.py pending-deletions --delete-now 4  # delete now (type the name, or --yes)
+```
+
+The dashboard's **Pending deletion** page does the same. `onboard` refuses a name that's pending
+deletion. After a lost database, `rebuild` restores a pending node as a pending deletion, never as
+a live node.
 
 ### Resolving a stuck per-instance lock
 
@@ -460,7 +545,7 @@ instance and its volumes. To put the original back:
 python instance_manager.py backup-list                   # what's kept, since when
 python instance_manager.py stop --name web-1             # only if it's onboarded and running
 python instance_manager.py rollback --name web-1         # original addresses, label and volumes back
-python instance_manager.py backup-delete --name web-1    # once you're sure; it bills until then
+python instance_manager.py backup-delete --name web-1    # once you're sure; deleted after the grace period (--now for at once)
 ```
 
 `rollback` refuses while the node is running as a managed instance, or when an original VPC
@@ -515,19 +600,38 @@ fingerprint of their own content and never overwritten. Treat write access to th
 shell access to your instances. `rebuild` refuses to restore any hook whose content no longer
 matches the fingerprint its tag records, so a modified object is detected rather than run.
 
-### Rotating the Linode API token
+### Rotating credentials
 
-Generate a new Personal Access Token in Cloud Manager with the same scopes as the one being
-replaced (see "Environment configuration reference" above), update `LINODE_API_TOKEN` in `.env`,
-and restart both the scheduler and API server processes so they pick up the new value (this
-token is read once, at process startup — editing `.env` alone changes nothing until the process
-restarts).
+`rotate-credentials` replaces a credential in place, with no restart:
+
+```bash
+python instance_manager.py rotate-credentials api-token      # new token, same scopes and lifetime
+python instance_manager.py rotate-credentials bucket-key     # new Object Storage key, same bucket access
+python instance_manager.py rotate-credentials oauth-secret   # reset the dashboard login's client secret
+python instance_manager.py rotate-credentials ssh-key        # new deployment SSH key on every node
+python instance_manager.py rotate-credentials ssh-key --continue   # move nodes not moved yet
+```
+
+- `api-token`: the new token is written to `.env` and picked up by the running services; the old
+  one is revoked only once the scheduler has switched to the new one.
+- `bucket-key`: the new key is tested against the bucket and written to `.env`, then the old key is
+  deleted.
+- `oauth-secret`: the new secret is written to `.env`; the old one stops working at once.
+- `ssh-key`: the old key stays usable (encrypted in the database and bucket, and offered by every
+  SSH connection via `LINODE_SSH_PREVIOUS_KEY_PATH`) until every node trusts the new key. Running
+  nodes move at once — new key added, a login with only the new key proven, old key removed;
+  stopped nodes after their next start, which the scheduler handles. After a restore mid-rotation,
+  `ssh-key-restore` restores the previous key too. If you use the assisted migration copy, update
+  the Lish key in your Linode profile to the new public key.
+
+Over the API, `POST /system/credentials/rotate` does the same (an admin-level action). You can still rotate in Cloud Manager and edit `.env` by hand; the running services read
+the changed values without a restart.
 
 ## Upgrading
 
 1. Read the release notes for the version you're upgrading to.
 2. Back up `state/instances.db` first (see above) — cheap insurance before any upgrade.
-3. Pull the new release, reinstall dependencies (`pip install -r requirements.txt`, and
+3. Pull the new release, reinstall dependencies (`pip install --require-hashes -r requirements.lock`, and
    `npm ci && npm run build` under `web/` if you run the dashboard).
 4. Restart both services:
    ```bash
@@ -692,6 +796,9 @@ a week, rehearse at your real scale, then onboard production in waves.
 | The copy ends with `COPY_FAILED` | The block copy hit an error | Don't run `migrate-resume`. Run `migrate-start --force` to start over with a fresh volume |
 | `migrate-copy` says the key is not one of the profile's Lish keys | The deployment's public key isn't registered for Lish, or the profile allows only password login | Add the key in Cloud Manager: Profile → LISH Console Settings, allow keys; `migrate-copy --check` confirms |
 | `onboard` refuses with "still on local disk" | The instance hasn't been migrated onto a Block Storage volume yet | Run the Path B migration (`migrate-start` / `migrate-resume`) first — see the Definitive Guide, Part II.2 |
+| `onboard` refuses with "was offboarded and is pending deletion" | That name was offboarded and is inside its grace period | `pending-deletions` — recover it, delete it now, or use another name |
+| Any change on the dashboard or API returns 409 "This host is a standby", or the CLI refuses with "this host is a standby" | Another scheduler holds the lease | Make the change on the active host. If it's gone for good, `scheduler-lease --take-over` (or System backup → Active scheduler) here first |
+| An alert about the clock | The host clock is more than 60 seconds off Linode's API time, or not time-synchronized | `timedatectl set-ntp true`; check `timedatectl status` |
 | `onboard` refuses with "IP not reserved" | The instance's public IP is still an ordinary, ephemeral one | Reserve it first via Cloud Manager, or use the one-time in-flow "reserve and retry" option on the dashboard's onboarding screen |
 | A stop/start command refuses with "already operating on" | A per-instance lock is held — normally released automatically when the holding process exits | Confirm nothing is actually mid-operation on that instance, then `clear-lock --name <name>` |
 | `rebuild` recovered an instance as `needs_manual_recovery` instead of `stopped` | Neither tags nor Object Storage had a complete-enough record for it at the moment of loss — most commonly, Object Storage wasn't configured yet, or that specific instance hadn't been stopped/onboarded since it was | See "Recovering from a lost or corrupted registry" above for the manual-boot recovery steps, and Part 5.6 of the Definitive Guide for the full edge-case table |

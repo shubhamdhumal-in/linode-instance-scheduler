@@ -218,6 +218,26 @@ their schedule after an outage are listed for approval (`schedule-catch-up`); an
 webhook or email. To move to a new cluster, deploy as usual with an empty PVC, then from the pod:
 `ssh-key-restore --save-passphrase` (if the key Secret is gone), `restore`, `rebuild`, `heal`.
 
+Also the same on LKE: `offboard` and `backup-delete` hold resources for a grace period before
+deleting them (`LIS_DELETION_GRACE_DAYS` in the Secret or ConfigMap, default 7; `pending-deletions`
+to list, recover or delete now); `restore-item` puts back one schedule, set of hooks or group from a
+snapshot; bucket versioning is turned on automatically; the clock check alerts when the node's
+clock drifts. A second deployment of this tool against the same bucket (an old cluster coming back)
+stands by and refuses changes — its API returns `409` for anything but reads.
+
+What doesn't apply here:
+
+- **The release copy** (`release-backup`) and **recovery drills** (`recovery-drill`) are built
+  around `install.sh` on a VM. On LKE, the container image is the release: keep using a pinned
+  image tag, which is all a new cluster needs. The image installs its Python dependencies from
+  `requirements.lock` with `--require-hashes`.
+- **`rotate-credentials`** writes new values to `.env` and to the SSH key file, but here the
+  settings and the key come from Kubernetes Secrets mounted read-only. Rotate the API token, bucket
+  key or OAuth secret in Cloud Manager and update the Secret instead (§10). The deployment SSH key
+  is trusted by every managed node, so replacing it in the Secret alone would lock the nodes out:
+  add the new public key to every node's `authorized_keys` first, then swap the Secret.
+  `LINODE_SSH_PREVIOUS_KEY_PATH` isn't used on LKE.
+
 ---
 
 ## 9. Upgrading
@@ -251,8 +271,10 @@ schedule window during it self-corrects on the next poll tick once the new pod i
   only readable by whoever has RBAC access to `get`/`list` Secrets in this namespace —
   scope that access the same way you would for any other sensitive Secret on the cluster.
 - The SSH keypair mounted into the pod is dedicated to this tool only — never a personal or
-  shared key — so it can be rotated independently by replacing `ssh-key-secret.yaml` and
-  restarting the Deployment.
+  shared key. Every managed node trusts only this key, so replacing `ssh-key-secret.yaml` on
+  its own locks the tool out of them: first add the new public key to `/root/.ssh/authorized_keys`
+  on every node (keeping the old line), then replace the Secret and restart the Deployment, and
+  only after the next start/stop cycle of each node remove the old line.
 - `LINODE_API_TOKEN` is scoped to exactly what's needed, not a token with broader account
   access than this tool actually uses.
 - The API/dashboard stays in-cluster-only (§7) unless you deliberately choose
@@ -261,7 +283,8 @@ schedule window during it self-corrects on the next poll tick once the new pod i
   false` and every Linux capability dropped (`k8s/deployment.yaml`) — don't loosen this
   without a specific reason.
 - If a credential is ever pasted somewhere it shouldn't have been, rotate it in Cloud
-  Manager and update `k8s/secret.yaml`/`ssh-key-secret.yaml`, then `kubectl apply` again and
+  Manager and update `k8s/secret.yaml` (for the SSH key, follow the order above), then
+  `kubectl apply` again and
   `kubectl rollout restart deployment/linode-instance-scheduler -n <namespace>` — no code
   changes needed.
 

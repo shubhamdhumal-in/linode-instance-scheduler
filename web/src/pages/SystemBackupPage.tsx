@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type { HealthStatus, SystemBackupStatus } from '../api/types'
 import { AlertSettingsForm } from '../components/AlertSettingsForm'
+import { RestoreItemCard } from '../components/RestoreItemCard'
 import { Button, Card, CardHeader, ErrorBanner, Spinner } from '../components/ui'
 import { useStatusBar } from '../status/StatusBarContext'
 import { PageHeader } from './DashboardLayout'
@@ -581,6 +582,8 @@ export function SystemBackupPage() {
                 </div>
               </div>
             </Card>
+
+            {status.object_storage.configured && <RestoreItemCard />}
 
             <Card>
               <CardHeader title="On this host" />

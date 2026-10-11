@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
-import type { ApiToken, ApiTokenBundle, ApiTokenOperation, ApiTokenScope } from '../api/types'
+import type { ApiToken, ApiTokenBundle, ApiTokenScope, TokenScopeCatalog } from '../api/types'
+import { MultiPicker } from '../components/MultiPicker'
 import { Button, Card, CardHeader, EmptyState, ErrorBanner, Spinner, WarningBanner } from '../components/ui'
 import { PageHeader } from './DashboardLayout'
 const SCOPES: {
@@ -8,75 +9,69 @@ const SCOPES: {
   label: string
   help: string
 }[] = [
-  { value: 'read', label: 'Read', help: 'list, status, history, savings' },
-  { value: 'operate', label: 'Operate', help: 'start, stop, extend, group start/stop' },
-  { value: 'configure', label: 'Configure', help: 'schedules, groups, dependencies, manual-only' },
-  { value: 'admin', label: 'Admin', help: 'everything: hooks, onboard/offboard, tokens' },
-]
-const OPERATIONS: {
-  group: string
-  items: {
-    value: ApiTokenOperation
-    label: string
-  }[]
-}[] = [
   {
-    group: 'View',
-    items: [
-      { value: 'instances:list', label: 'List nodes' },
-      { value: 'instances:status', label: 'Node status' },
-      { value: 'instances:history', label: 'Node history' },
-      { value: 'savings:read', label: 'Savings' },
-      { value: 'activity:read', label: 'Activity log' },
-      { value: 'logs:read', label: 'Service logs' },
-    ],
+    value: 'read',
+    label: 'Read',
+    help: 'view nodes, schedules, groups, savings, pending deletions, snapshots, system status',
   },
+  {
+    value: 'operate',
+    label: 'Operate',
+    help: 'start, stop, extend, group start/stop, catch-up, run a backup',
+  },
+  {
+    value: 'configure',
+    label: 'Configure',
+    help: 'schedules, groups, start order, manual-only, recover a pending deletion, restore an item',
+  },
+  {
+    value: 'admin',
+    label: 'Admin',
+    help: 'everything: hooks, onboard/offboard, delete now, credentials, tokens, logs',
+  },
+]
+const OPERATION_GROUPS: {
+  group: string
+  match: (op: string) => boolean
+}[] = [
+  { group: 'View', match: (op) => /^(instances:(list|status|history)|savings:|activity:|logs:)/.test(op) },
   {
     group: 'Run',
-    items: [
-      { value: 'instances:start', label: 'Start a node' },
-      { value: 'instances:stop', label: 'Stop a node' },
-      { value: 'instances:extend', label: 'Extend an override' },
-      { value: 'groups:start', label: 'Start a group' },
-      { value: 'groups:stop', label: 'Stop a group' },
-    ],
+    match: (op) =>
+      /^(instances:(start|stop|extend|clear-lock)|groups:(start|stop)|schedules:catch-up)/.test(op),
   },
-  {
-    group: 'Schedules & groups',
-    items: [
-      { value: 'schedules:read', label: 'Read schedules' },
-      { value: 'schedules:write', label: 'Set/clear schedules' },
-      { value: 'groups:read', label: 'Read groups' },
-      { value: 'groups:write', label: 'Create/delete groups, group schedules' },
-      { value: 'groups:membership', label: 'Add/remove group members' },
-      { value: 'dependencies:write', label: 'Start order (dependencies)' },
-      { value: 'mode:write', label: 'Manual-only mode' },
-    ],
-  },
-  {
-    group: 'Hooks',
-    items: [
-      { value: 'hooks:read', label: 'Read hooks' },
-      { value: 'hooks:write', label: 'Set/clear hooks (runs as root)' },
-      { value: 'hooks:run', label: 'Run a hook now' },
-    ],
-  },
-  {
-    group: 'Lifecycle & admin',
-    items: [
-      { value: 'instances:onboard', label: 'Onboard' },
-      { value: 'instances:migrate', label: 'Migrate to a volume' },
-      { value: 'instances:offboard', label: 'Offboard / remove from tracking' },
-      { value: 'instances:vpc-address', label: 'Change VPC address' },
-      { value: 'tokens:manage', label: 'Manage tokens (no wider than itself)' },
-    ],
-  },
+  { group: 'Schedules & groups', match: (op) => /^(schedules:|groups:|dependencies:|mode:)/.test(op) },
+  { group: 'Hooks', match: (op) => op.startsWith('hooks:') },
+  { group: 'Lifecycle', match: (op) => /^(instances:|deletions:)/.test(op) },
+  { group: 'Backups & system', match: (op) => /^(backups:|system:)/.test(op) },
+  { group: 'Admin', match: (op) => /^(tokens:|credentials:)/.test(op) },
 ]
-function splitList(text: string): string[] | null {
-  const items = text
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
+function groupOperations(
+  ops: {
+    value: string
+    description: string
+  }[],
+) {
+  const out: {
+    group: string
+    items: {
+      value: string
+      description: string
+    }[]
+  }[] = []
+  for (const op of ops) {
+    const group = OPERATION_GROUPS.find((g) => g.match(op.value))?.group ?? 'Other'
+    let bucket = out.find((g) => g.group === group)
+    if (!bucket) {
+      bucket = { group, items: [] }
+      out.push(bucket)
+    }
+    bucket.items.push(op)
+  }
+  const order = [...OPERATION_GROUPS.map((g) => g.group), 'Other']
+  return out.sort((a, b) => order.indexOf(a.group) - order.indexOf(b.group))
+}
+function orNull(items: string[]): string[] | null {
   return items.length ? items : null
 }
 export function TokensPage() {
@@ -85,8 +80,21 @@ export function TokensPage() {
   const [warnings, setWarnings] = useState<string[]>([])
   const [name, setName] = useState('')
   const [scopes, setScopes] = useState<ApiTokenScope[]>(['read', 'operate'])
-  const [instances, setInstances] = useState('')
-  const [groups, setGroups] = useState('')
+  const [instances, setInstances] = useState<string[]>([])
+  const [groups, setGroups] = useState<string[]>([])
+  const [catalog, setCatalog] = useState<TokenScopeCatalog | null>(null)
+  const [nodeOptions, setNodeOptions] = useState<
+    {
+      value: string
+      hint?: string
+    }[]
+  >([])
+  const [groupOptions, setGroupOptions] = useState<
+    {
+      value: string
+      hint?: string
+    }[]
+  >([])
   const [expiresDays, setExpiresDays] = useState('')
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
@@ -112,6 +120,33 @@ export function TokensPage() {
   useEffect(() => {
     mountedRef.current = true
     reload()
+    api
+      .tokenScopes()
+      .then((c) => {
+        if (mountedRef.current) setCatalog(c)
+      })
+      .catch(() => {})
+    api
+      .listInstances()
+      .then((r) => {
+        if (!mountedRef.current) return
+        setNodeOptions(
+          Object.entries(r)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([n, rec]) => ({
+              value: n,
+              hint: rec.schedule_mode === 'manual' ? 'manual-only' : undefined,
+            })),
+        )
+      })
+      .catch(() => {})
+    api
+      .listGroups()
+      .then((g) => {
+        if (mountedRef.current)
+          setGroupOptions(g.map((x) => ({ value: x.name })).sort((a, b) => a.value.localeCompare(b.value)))
+      })
+      .catch(() => {})
     return () => {
       mountedRef.current = false
     }
@@ -127,16 +162,16 @@ export function TokensPage() {
       const created = await api.createToken({
         name: name.trim(),
         scopes,
-        instances: splitList(instances),
-        groups: splitList(groups),
+        instances: orNull(instances),
+        groups: orNull(groups),
         expires_days: days,
       })
       if (!mountedRef.current) return
       setNewToken({ name: created.name, token: created.token })
       setWarnings(created.warnings ?? [])
       setName('')
-      setInstances('')
-      setGroups('')
+      setInstances([])
+      setGroups([])
       setExpiresDays('')
       reload()
     } catch (e) {
@@ -213,6 +248,20 @@ export function TokensPage() {
                     <span>
                       <span className="font-medium text-slate-900">{s.label}</span>
                       <span className="block text-xs text-slate-500">{s.help}</span>
+                      {catalog?.bundles[s.value] && (
+                        <details className="text-xs text-slate-500">
+                          <summary className="cursor-pointer">
+                            {catalog.bundles[s.value].length} operations
+                          </summary>
+                          <ul className="mt-1 list-disc pl-4">
+                            {catalog.bundles[s.value].map((op) => (
+                              <li key={op}>
+                                <code>{op}</code>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      )}
                     </span>
                   </label>
                 ))}
@@ -220,48 +269,48 @@ export function TokensPage() {
               <details className="mt-3">
                 <summary className="cursor-pointer text-slate-700">Or pick single operations</summary>
                 <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {OPERATIONS.map((g) => (
-                    <div key={g.group}>
-                      <div className="text-xs font-semibold uppercase text-slate-500">{g.group}</div>
-                      {g.items.map((op) => (
-                        <label key={op.value} className="flex items-center gap-2">
-                          <input
-                            type="checkbox"
-                            aria-label={op.value}
-                            checked={scopes.includes(op.value)}
-                            onChange={() => toggleScope(op.value)}
-                          />
-                          <span>
-                            {op.label} <code className="text-xs text-slate-500">{op.value}</code>
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  ))}
+                  {catalog === null && <Spinner />}
+                  {catalog &&
+                    groupOperations(catalog.operations).map((g) => (
+                      <div key={g.group}>
+                        <div className="text-xs font-semibold uppercase text-slate-500">{g.group}</div>
+                        {g.items.map((op) => (
+                          <label key={op.value} className="flex items-start gap-2">
+                            <input
+                              type="checkbox"
+                              className="mt-1"
+                              aria-label={op.value}
+                              checked={scopes.includes(op.value)}
+                              onChange={() => toggleScope(op.value)}
+                            />
+                            <span>
+                              {op.description.charAt(0).toUpperCase() + op.description.slice(1)}{' '}
+                              <code className="text-xs text-slate-500">{op.value}</code>
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    ))}
                 </div>
               </details>
             </fieldset>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <label className="block">
-                <span className="text-slate-700">Only these nodes</span>
-                <input
-                  aria-label="Allowed nodes"
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-3 py-1.5"
-                  placeholder="web-1, web-2"
-                  value={instances}
-                  onChange={(e) => setInstances(e.target.value)}
-                />
-              </label>
-              <label className="block">
-                <span className="text-slate-700">Only these groups</span>
-                <input
-                  aria-label="Allowed groups"
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-3 py-1.5"
-                  placeholder="dev"
-                  value={groups}
-                  onChange={(e) => setGroups(e.target.value)}
-                />
-              </label>
+              <MultiPicker
+                label="Only these nodes"
+                options={nodeOptions}
+                selected={instances}
+                onChange={setInstances}
+                placeholder="Any node"
+                emptyText="No onboarded nodes yet"
+              />
+              <MultiPicker
+                label="Only these groups"
+                options={groupOptions}
+                selected={groups}
+                onChange={setGroups}
+                placeholder="Any group"
+                emptyText="No groups yet"
+              />
               <label className="block">
                 <span className="text-slate-700">Expires after (days)</span>
                 <input
@@ -274,7 +323,9 @@ export function TokensPage() {
               </label>
             </div>
             <p className="text-xs text-slate-500">
-              Leave nodes and groups empty for a token that can act on everything its scopes allow.
+              Leave nodes and groups empty for a token that can act on everything its scopes allow. A group
+              covers its current members. Manual-only nodes can be picked too: the token can start and stop
+              them; only the scheduler leaves them alone.
             </p>
             <Button
               variant="primary"

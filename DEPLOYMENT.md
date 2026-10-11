@@ -55,6 +55,7 @@ updates the code and dependencies, rebuilds the dashboard and restarts the servi
 |---|---|
 | `sudo ./install.sh install` | First-time install (or upgrade, when re-run) |
 | `sudo ./install.sh recover` | Set up a replacement host and restore everything — see §8.1 |
+| `sudo ./install.sh recover --drill` | A read-only rehearsal of `recover` on a throwaway host: restores the snapshot and the key and checks they'd work, changing nothing anywhere (run for you by `recovery-drill`) — see §8.4 |
 | `sudo ./install.sh start` | Start the services (after `recover --no-start`) |
 | `sudo ./install.sh backup-now` | Back up right now |
 | `sudo ./install.sh status` | Services, latest backups, managed instances |
@@ -62,6 +63,9 @@ updates the code and dependencies, rebuilds the dashboard and restarts the servi
 The dashboard needs Node.js 20.19+ or 22.12+ to build. If the host's own Node.js is older or
 missing, the script downloads the official Node.js release from nodejs.org, checks it against the
 published SHA-256 checksums, uses it for the build, and removes it afterwards.
+Run from an extracted release copy (§8.7), which carries its built dashboard and dependency wheels,
+it needs neither Node.js nor PyPI. Python dependencies are always installed from
+`requirements.lock` with `--require-hashes`.
 
 ---
 
@@ -139,8 +143,12 @@ git clone https://github.com/sandipgangdhar/linode-instance-scheduler.git
 cd linode-instance-scheduler
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 ```
+
+`requirements.lock` pins every Python dependency to an exact version with its SHA-256 hashes, so
+`pip` refuses any file that isn't exactly what was released. `install.sh` and the container image
+install the same way.
 
 Pick a real, deliberate install location — e.g. `/opt/linode-instance-scheduler` — rather than a
 home directory, so the path is stable across whoever administers this host over time. The
@@ -181,6 +189,13 @@ Fill in:
   settings only you can open (§8).
 - **`LIS_ALERT_WEBHOOK_URL`, `LIS_ALERT_EMAIL_TO` and the `LIS_ALERT_SMTP_*` settings** —
   optional alerts (§8.2).
+- **`LIS_DELETION_GRACE_DAYS`** — optional; how many days `offboard` and `backup-delete` hold
+  resources before deleting them (default 7; `0` deletes at once). See §8.5.
+- **`LIS_RECOVERY_DRILL_DAYS`** — optional; run a recovery drill every N days (e.g. `7`; unset means
+  only when you run one). See §8.4.
+- **`LIS_ALLOW_STANDBY_CHANGES`** — optional; `1` lets a standby host make changes anyway (§8.3).
+- **`LINODE_SSH_PREVIOUS_KEY_PATH`** — set for you during a deployment SSH key rotation (§8.6);
+  leave it alone.
 - **`API_ALLOWED_ORIGINS`** — only needed if a browser-based client (the dashboard, or your own
   frontend) will call the REST API from a *different* origin than the one serving it. Leave unset
   to disable CORS entirely — correct for the common case where the dashboard is served by the same
@@ -438,6 +453,9 @@ cd linode-instance-scheduler
 sudo ./install.sh recover
 ```
 
+If GitHub isn't reachable, use the release copy kept in your own bucket instead of `git clone`
+(§8.7).
+
 Give it the same API token and the **same bucket** the old host used. Leave the passphrase question
 blank: it's fetched from your Linode account. It then, before starting anything:
 
@@ -521,8 +539,10 @@ An alert is sent when one of these starts, again every 6 hours while it lasts, a
 clears: the scheduler hasn't checked in for 10 minutes (noticed by the API service), backups are
 failing or the daily restore test fails, the deployment SSH key isn't stored in every place, nodes
 stay off their schedule, the Linode API token is rejected or expires within 14 days, the disk
-holding the database is nearly full, Shutdown Watchdog is off on this host, or this host is
-standing by because another scheduler holds the lease (§8.3).
+holding the database is nearly full, Shutdown Watchdog is off on this host, this host is
+standing by because another scheduler holds the lease (§8.3), a pending deletion is overdue or
+failing (§8.5), bucket versioning can't be turned on (§8.8), the last recovery drill failed or none
+ran recently (when drills are on, §8.4), or the host's clock is off or not synchronized (§8.10).
 
 **When the whole host is gone** nothing on it can send an alert. Two things cover that:
 `install.sh` turns on Linode's **Shutdown Watchdog** for this host, so a crash or unexpected
@@ -545,6 +565,13 @@ it up at once. `scheduler-lease` shows who holds it; `scheduler-lease --take-ove
 backup page) makes this host the active one. Without Object Storage there's no shared place for a
 lease, so make sure only one scheduler runs.
 
+A standby host also **refuses changes**: its API returns `409` for anything but reads (and the
+take-over itself), and the CLI refuses commands that change nodes, schedules or settings, naming
+the active host. Make changes there. `LIS_ALLOW_STANDBY_CHANGES=1` overrides this. If the bucket
+can't be reached, the scheduler that was active carries on, while a host that has never been the
+active one stays standby, since it can't tell whether the other is still running;
+`scheduler-lease --take-over` overrides that.
+
 ### 8.4 Restore testing and upgrades
 
 Every day the scheduler restore-tests the backups without touching the live database: it downloads
@@ -556,8 +583,95 @@ the integrity check is ever uploaded, so a damaged database can't replace a good
 Re-running `install.sh install` to upgrade first takes a snapshot with the old code into
 `backups/pre-upgrade-<time>/`; the end of the run says how to go back to the previous version with
 it.
+
+**Recovery drills.** A restore test proves the backups open; a drill proves a new host could take
+over. `recovery-drill` creates a throwaway `g6-nanode-1` (tagged `lis-recovery-drill`, in this
+host's region unless `--region` is given), copies the release copy (§8.7) and a minimal `.env` to
+it, and runs `install.sh recover --drill` there. That restores the latest snapshot and the SSH key,
+then `recovery-drill-check` verifies every node's volumes and reserved IP exist and every running
+node answers over SSH with the restored key. A drill host is read-only: no lease, no `rebuild` or
+`heal`, no uploads, no services. The VM is always deleted afterwards (`--keep-vm` keeps it to
+inspect; delete it yourself). Each drill costs a nanode for about 10–15 minutes. Set
+`LIS_RECOVERY_DRILL_DAYS=7` to have the scheduler run one weekly; an alert is sent when the last
+drill failed or none has run recently.
 `alerts-test` sends a test message; `alerts-check` lists what would be alerted right now and exits
 1 if anything — handy for your own monitoring. The System backup page shows the same.
+
+### 8.5 Deletions wait out a grace period
+
+`offboard` and `backup-delete` don't delete anything at once. The node (or backup) leaves
+management immediately, but its reserved IP and volumes are kept, with all their tags, plus
+`lis-pending-delete:<date>` (or `lis-pending-untag:<date>` on a volume that will be kept) and
+`lis-pending-of:<name>`, for `LIS_DELETION_GRACE_DAYS` days (default 7; `0` deletes at once). When
+one is due, the active scheduler carries it out, re-checking each resource first: anything no
+longer marked, attached or assigned to an instance, or claimed by another name is left alone.
+`pending-deletions` lists them; `--recover ID` brings a node back stopped with its schedule, group,
+hooks, manual-only mode and holiday setting; `--delete-now ID` deletes at once. `offboard --now` and
+`backup-delete --now` skip the grace period. A pending node survives a lost database: `rebuild`
+restores it as a pending deletion (from Object Storage, or from its tags alone), never as a live
+node. An overdue or failing deletion is alerted.
+
+### 8.6 Rotating credentials
+
+`rotate-credentials` replaces one credential without downtime:
+
+- `api-token` — a new Personal Access Token with the same scopes (and lifetime, if the old one
+  expires) is written to `.env` and picked up by the running services without a restart; the old
+  one is revoked only after the scheduler has switched.
+- `bucket-key` — a new Object Storage key with the same bucket access, tested, written to `.env`;
+  then the old key is deleted.
+- `oauth-secret` — the dashboard OAuth client's secret is reset and the new one written to `.env`.
+- `ssh-key` — a new deployment key. The old one is kept (encrypted in the database and the bucket,
+  and offered by every SSH connection through `LINODE_SSH_PREVIOUS_KEY_PATH`) until every node
+  trusts the new key. Running nodes move at once (new key added, a login with only the new key
+  proven, old key removed); stopped nodes after their next start — the scheduler does this, or
+  `rotate-credentials ssh-key --continue`. After a restore part way through, `ssh-key-restore` also
+  restores the previous key. If you use the assisted migration copy, put the new public key in
+  your profile's Lish keys afterwards.
+
+The API token can only rotate what it's allowed to manage (personal access tokens, Object Storage
+keys, OAuth apps); otherwise the command refuses with the reason. Rotating in Cloud Manager and
+editing `.env` by hand still works too.
+
+### 8.7 A copy of the release in your bucket
+
+So that recovering onto a new host doesn't depend on GitHub, PyPI or nodejs.org, the scheduler
+keeps the installed release in your bucket: `deployment/release/<version>.tar.gz` and
+`deployment/release/latest.tar.gz`, holding the code, the built dashboard, `requirements.lock` and
+a wheel of every dependency for this host's platform. It's uploaded whenever the installed code
+changes, and again if removed. `release-backup` uploads now (`--force` even if unchanged, `--output
+FILE` writes a local archive instead). To use it, fetch it with any S3 tool and the bucket keys,
+extract it and run the installer from inside — it installs with no download from GitHub, PyPI or
+Node.js (falling back to PyPI if the bundled wheels don't fit the new host's platform or Python):
+
+```
+aws s3 cp s3://<bucket>/deployment/release/latest.tar.gz . \
+    --endpoint-url https://<region>.linodeobjects.com
+tar xzf latest.tar.gz && cd linode-instance-scheduler
+sudo ./install.sh recover
+```
+
+### 8.8 Bucket versioning
+
+When backups are configured, versioning is turned on for the bucket, with a lifecycle rule
+expiring old versions 30 days after they were overwritten or deleted (other lifecycle rules are
+kept). The health check turns it back on if it's found off. The bucket's access key needs
+permission to change bucket settings; if it doesn't, an alert says so. `bucket-protection` shows
+it, `--enable` turns it on, `--key KEY` lists an object's versions and `--key KEY --restore-version
+VERSION_ID` makes an older version current again.
+
+### 8.9 Putting back one item
+
+`restore-item {schedule,hooks,group} --name X` restores one node's schedule or hooks, or one group,
+from the newest snapshot (`--snapshot KEY` for another, `--from-file PATH` for a local one,
+`--show` to only look, `--with-members` to also re-add a group's members). The dashboard's System
+backup page has the same as **Restore one item from a snapshot**.
+
+### 8.10 Clock
+
+Schedules, the lease and backup ages depend on the host's clock. An alert is sent when it's more
+than 60 seconds off Linode's API time or the operating system reports it isn't time-synchronized;
+`timedatectl set-ntp true` fixes the usual cause.
 
 ---
 
@@ -577,7 +691,7 @@ By hand:
 cd /opt/linode-instance-scheduler
 git pull
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 sudo systemctl restart linode-scheduler-poll linode-scheduler-api   # the second only if you run it
 ```
 
@@ -597,8 +711,7 @@ an update — there's no separate migration step to run by hand.
   access than this tool actually uses.
 - The REST API binds to `127.0.0.1` and sits behind a real TLS-terminating reverse proxy (§6) —
   never exposed directly on a public interface.
-- If an OAuth Client Secret or API token is ever pasted somewhere it shouldn't have been (a chat
-  log, a support ticket, a shared document), rotate it: Cloud Manager lets you reset an OAuth
-  App's secret and revoke/recreate a Personal Access Token independently, with no code changes
-  needed here beyond updating `.env` and restarting the affected service.
+- If an OAuth Client Secret, API token, bucket key or the deployment SSH key is ever pasted
+  somewhere it shouldn't have been (a chat log, a support ticket, a shared document), rotate it
+  with `rotate-credentials` (§8.6).
 - Run services as a dedicated unprivileged system user (§5), never as `root`.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import dataclasses
 import ipaddress
@@ -13,6 +14,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 from collections import OrderedDict
@@ -127,6 +129,40 @@ if _allowed_origins:
         CORSMiddleware, allow_origins=_allowed_origins, allow_credentials=True,
         allow_methods=["*"], allow_headers=["*"],
     )
+
+
+_STANDBY_CACHE: dict = {"at": 0.0, "lease": None}
+_STANDBY_CACHE_LOCK = threading.Lock()
+_STANDBY_EXEMPT_PATHS = {"/system/lease/take-over", "/oauth/callback", "/login", "/logout"}
+
+
+def _active_elsewhere() -> dict | None:
+    if os.environ.get("LIS_ALLOW_STANDBY_CHANGES", "").strip() == "1":
+        return None
+    now = time.monotonic()
+    with _STANDBY_CACHE_LOCK:
+        if now - _STANDBY_CACHE["at"] < 30:
+            return _STANDBY_CACHE["lease"]
+    lease = im.another_scheduler_active()
+    with _STANDBY_CACHE_LOCK:
+        _STANDBY_CACHE.update(at=time.monotonic(), lease=lease)
+    return lease
+
+
+@app.middleware("http")
+async def _refuse_changes_on_standby(request: Request, call_next):
+
+    with contextlib.suppress(Exception):
+        im.reload_object_storage_settings_if_changed()
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.url.path not in _STANDBY_EXEMPT_PATHS:
+        lease = await asyncio.to_thread(_active_elsewhere)
+        if lease is not None:
+            return JSONResponse(status_code=409, content={
+                "detail": f"This host is a standby: {lease.get('host')} is the active scheduler. "
+                          "Make changes on that host's dashboard. If it's gone, take over from "
+                          "System backup > Active scheduler.",
+                "standby": True, "active_host": lease.get("host")})
+    return await call_next(request)
 
 
 def _client(request: Request):
@@ -262,6 +298,9 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("POST", "/holidays"): "schedules:write",
     ("DELETE", "/holidays"): "schedules:write",
     ("DELETE", "/backups/{name}"): "instances:migrate",
+    ("GET", "/pending-deletions"): "deletions:read",
+    ("POST", "/pending-deletions/{entry_id}/recover"): "deletions:recover",
+    ("POST", "/pending-deletions/{entry_id}/delete-now"): "deletions:delete-now",
     ("POST", "/instances/{name}/offboard"): "instances:offboard",
     ("POST", "/instances/{name}/deregister"): "instances:offboard",
     ("POST", "/instances/{name}/clear-lock"): "instances:clear-lock",
@@ -274,6 +313,17 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("GET", "/system/host-watchdog"): "system:read",
     ("POST", "/system/backup/run"): "system:backup",
     ("POST", "/system/backup/verify"): "system:backup",
+    ("GET", "/system/snapshots"): "backups:read",
+    ("GET", "/system/credentials/rotation"): "system:read",
+    ("POST", "/system/credentials/rotate"): "credentials:rotate",
+    ("GET", "/system/release-copy"): "backups:read",
+    ("GET", "/system/recovery-drill"): "backups:read",
+    ("POST", "/system/recovery-drill"): "backups:drill",
+    ("POST", "/system/release-copy"): "backups:release-copy",
+    ("GET", "/system/bucket-protection"): "backups:read",
+    ("POST", "/system/bucket-protection"): "backups:versioning",
+    ("POST", "/system/restore-item/preview"): "backups:read",
+    ("POST", "/system/restore-item"): "backups:restore-item",
     ("POST", "/system/env-backup/run"): "system:backup",
     ("POST", "/system/ssh-key/protect"): "system:backup",
     ("POST", "/system/heal"): "system:configure",
@@ -284,6 +334,7 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("POST", "/instances/{name}/vpc-address"): "instances:vpc-address",
     ("POST", "/tokens"): "tokens:manage",
     ("GET", "/tokens"): "tokens:manage",
+    ("GET", "/tokens/scopes"): "tokens:manage",
     ("DELETE", "/tokens/{token_name}"): "tokens:manage",
     ("GET", "/logs"): "logs:read",
     ("GET", "/logs/{service}"): "logs:read",
@@ -294,6 +345,8 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
 _LIMITED_TOKEN_OPEN_ROUTES = {
     ("GET", "/instances"), ("GET", "/groups"), ("GET", "/operations/{op_id}"),
     ("GET", "/activity"), ("GET", "/schedule/missed"), ("POST", "/schedule/missed/apply"),
+    ("GET", "/pending-deletions"), ("POST", "/pending-deletions/{entry_id}/recover"),
+    ("POST", "/pending-deletions/{entry_id}/delete-now"),
 }
 
 
@@ -770,6 +823,8 @@ class OnboardRequest(BaseModel):
 class OffboardRequest(BaseModel):
     delete_volumes: bool = False
 
+    immediate: bool = False
+
 
 class MigrateStartRequest(BaseModel):
     instance_id: int
@@ -924,6 +979,14 @@ def api_list_tokens(user: str = Depends(require_session)) -> list[dict]:
     return im.list_api_tokens()
 
 
+@app.get("/tokens/scopes")
+def api_token_scopes(user: str = Depends(require_session)) -> dict:
+
+    return {"bundles": {k: list(v) for k, v in im.API_TOKEN_SCOPE_BUNDLES.items()},
+            "operations": [{"value": k, "description": v}
+                           for k, v in im.API_TOKEN_FINE_SCOPES.items()]}
+
+
 @app.delete("/tokens/{token_name}")
 def api_revoke_token(
     token_name: str, request: Request, user: str = Depends(require_session),
@@ -1037,6 +1100,7 @@ def api_offboard(
     result, warnings = _call_collecting_warnings_with_progress(
         lambda on_progress, on_warning: im.offboard_instance(
             _client(request), name, delete_volumes=body.delete_volumes,
+            grace=not body.immediate,
             on_progress=on_progress, on_warning=on_warning,
         )
     )
@@ -1131,10 +1195,122 @@ def api_backup_verify(user: str = Depends(require_session)) -> dict:
     return dataclasses.asdict(im.verify_backups())
 
 
+@app.get("/system/snapshots")
+def api_list_snapshots(user: str = Depends(require_session)) -> dict:
+
+    return {"snapshots": im.list_database_snapshots()}
+
+
+class RestoreItemRequest(BaseModel):
+    kind: str
+    name: str
+    snapshot: str | None = None
+    with_members: bool = False
+
+
+@app.post("/system/restore-item/preview")
+def api_restore_item_preview(body: RestoreItemRequest, user: str = Depends(require_session)) -> dict:
+
+    item = im.read_item_from_snapshot(body.kind, body.name, snapshot_key=body.snapshot)
+    if body.kind == "schedule":
+        current = im.get_instance_schedule(body.name)
+    elif body.kind == "hooks":
+        current = im.get_instance_hooks(body.name)
+    else:
+        current = im.get_schedule_group(body.name)
+    return {"snapshot": item, "current": current}
+
+
+@app.post("/system/restore-item")
+def api_restore_item(body: RestoreItemRequest, request: Request,
+                     user: str = Depends(require_session)) -> dict:
+
+    result, warnings = _call_collecting_warnings(
+        lambda on_warning: im.restore_item_from_snapshot(
+            _client(request), body.kind, body.name, snapshot_key=body.snapshot,
+            with_members=body.with_members, actor=user, on_warning=on_warning))
+    out = dataclasses.asdict(result)
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+class RotateRequest(BaseModel):
+    kind: str
+    continue_rotation: bool = False
+
+
+@app.get("/system/credentials/rotation")
+def api_rotation_state(user: str = Depends(require_session)) -> dict:
+
+    return {"rotation": im.key_rotation_state()}
+
+
+@app.post("/system/credentials/rotate")
+def api_rotate_credentials(body: RotateRequest, request: Request, wait: bool = False,
+                           user: str = Depends(require_session)) -> JSONResponse:
+
+    if body.kind not in im.CREDENTIAL_KINDS:
+        raise HTTPException(400, f"kind must be one of {', '.join(im.CREDENTIAL_KINDS)}")
+    client = _client(request)
+
+    def _do(op_id: str):
+        progress, warning = _make_progress_reporter(op_id), _make_warning_reporter(op_id)
+        if body.kind == "ssh-key":
+            if body.continue_rotation:
+                return im.continue_key_rotation(client, on_progress=progress, on_warning=warning)
+            return im.rotate_deployment_ssh_key(client, on_progress=progress, on_warning=warning)
+        fn = {"api-token": im.rotate_api_token, "bucket-key": im.rotate_bucket_key,
+              "oauth-secret": im.rotate_oauth_secret}[body.kind]
+        return fn(client, on_progress=progress)
+
+    return _kickoff("credentials_rotate", 4, _do, wait, actor=user)
+
+
+@app.get("/system/recovery-drill")
+def api_recovery_drill_status(user: str = Depends(require_session)) -> dict:
+    return {"interval_days": im.drill_interval_days(), "last": im.recovery_drill_status()}
+
+
+@app.post("/system/recovery-drill")
+def api_recovery_drill(request: Request, wait: bool = False,
+                       user: str = Depends(require_session)) -> JSONResponse:
+
+    client = _client(request)
+    return _kickoff("recovery_drill", 3, lambda op_id: im.run_recovery_drill(
+        client, on_progress=_make_progress_reporter(op_id)), wait, actor=user)
+
+
+@app.get("/system/release-copy")
+def api_release_copy_status(user: str = Depends(require_session)) -> dict:
+    return {"version": im.release_version(), "last": im.release_backup_status()}
+
+
+@app.post("/system/release-copy")
+def api_release_copy(force: bool = False, user: str = Depends(require_session)) -> dict:
+
+    uploaded = im.backup_release_copy(force=force)
+    return {"version": im.release_version(), "uploaded": uploaded is not None,
+            "last": im.release_backup_status()}
+
+
+@app.get("/system/bucket-protection")
+def api_bucket_protection(user: str = Depends(require_session)) -> dict:
+    return im.osb.bucket_protection_status()
+
+
+@app.post("/system/bucket-protection")
+def api_enable_bucket_protection(user: str = Depends(require_session)) -> dict:
+
+    return im.osb.enable_bucket_protection()
+
+
 @app.post("/system/lease/take-over")
 def api_lease_take_over(user: str = Depends(require_session)) -> dict:
 
     status = im.acquire_or_renew_lease(take_over=True)
+    with _STANDBY_CACHE_LOCK:
+        _STANDBY_CACHE["at"] = 0.0
     im.record_activity(f"scheduler lease take-over {'succeeded' if status.active else 'failed'}",
                        level="warning", source="api", action="lease", actor=user)
     return dataclasses.asdict(status)
@@ -1422,7 +1598,8 @@ def api_rollback(
 
 @app.delete("/backups/{name}")
 def api_delete_backup(
-    name: str, request: Request, wait: bool = False, user: str = Depends(require_session),
+    name: str, request: Request, wait: bool = False, immediate: bool = False,
+    user: str = Depends(require_session),
 ) -> JSONResponse:
 
     if im.get_migration_backup(name) is None:
@@ -1431,11 +1608,60 @@ def api_delete_backup(
 
     def _do(op_id: str) -> im.BackupDeleteResult:
         return im.delete_migration_backup(
-            client, name, on_progress=_make_progress_reporter(op_id),
+            client, name, grace=not immediate, on_progress=_make_progress_reporter(op_id),
             on_warning=_make_warning_reporter(op_id),
         )
 
     return _kickoff("backup_delete", 4, _do, wait, actor=user)
+
+
+@app.get("/pending-deletions")
+def api_pending_deletions(request: Request, include_done: bool = False,
+                          user: str = Depends(require_session)) -> dict:
+
+    entries = im.list_pending_deletions(include_done=include_done)
+    meta = _limited_token(request)
+    if meta is not None:
+        entries = [e for e in entries if im.api_token_allows_instance(meta, e["name"])]
+    return {"grace_days": im.deletion_grace_days(), "entries": entries}
+
+
+def _pending_entry_or_404(request: Request, entry_id: int) -> dict:
+    entry = im.get_pending_deletion(entry_id)
+    meta = _limited_token(request)
+    if entry is None or (meta is not None and not im.api_token_allows_instance(meta, entry["name"])):
+        raise HTTPException(404, f"no pending deletion #{entry_id}.")
+    return entry
+
+
+@app.post("/pending-deletions/{entry_id}/recover")
+def api_recover_pending(entry_id: int, request: Request, wait: bool = False,
+                        user: str = Depends(require_session)) -> JSONResponse:
+
+    _pending_entry_or_404(request, entry_id)
+    client = _client(request)
+
+    def _do(op_id: str) -> dict:
+        return im.recover_pending(client, entry_id, actor=user,
+                                  on_progress=_make_progress_reporter(op_id),
+                                  on_warning=_make_warning_reporter(op_id))
+
+    return _kickoff("pending_recover", 6, _do, wait, actor=user)
+
+
+@app.post("/pending-deletions/{entry_id}/delete-now")
+def api_delete_pending_now(entry_id: int, request: Request, wait: bool = False,
+                           user: str = Depends(require_session)) -> JSONResponse:
+
+    _pending_entry_or_404(request, entry_id)
+    client = _client(request)
+
+    def _do(op_id: str) -> dict:
+        return im.delete_pending_now(client, entry_id, actor=user,
+                                     on_progress=_make_progress_reporter(op_id),
+                                     on_warning=_make_warning_reporter(op_id))
+
+    return _kickoff("pending_delete", 4, _do, wait, actor=user)
 
 
 class SystemBackupConfigRequest(BaseModel):
@@ -2258,6 +2484,8 @@ CONSOLE_COMMANDS = (
     "migrate-abandon", "schedule-catch-up", "ssh-key-protect", "env-backup", "alerts-check",
     "backup-verify", "scheduler-lease", "host-watchdog", "alerts-test",
     "backup-list", "rollback", "backup-delete", "console-session-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
+    "pending-deletions", "restore-item", "bucket-protection", "release-backup",
+    "rotate-credentials", "recovery-drill",
 )
 CONSOLE_MAX_RUNTIME_S = 3 * 3600
 CONSOLE_MAX_LINES = 20000
