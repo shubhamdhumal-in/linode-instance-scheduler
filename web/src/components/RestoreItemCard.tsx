@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type { RestoreItemRequest, RestoreItemResult } from '../api/types'
+import { MultiPicker } from './MultiPicker'
 import { Button, Card, CardHeader, ErrorBanner, WarningBanner } from './ui'
 const INPUT =
   'mt-1 block w-full rounded-md border-0 py-1.5 px-3 text-sm text-slate-900 ring-1 ring-inset ring-slate-300 focus:ring-2 focus:ring-indigo-600'
@@ -24,14 +25,54 @@ export function RestoreItemCard() {
   const [result, setResult] = useState<RestoreItemResult | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [nodeOptions, setNodeOptions] = useState<
+    {
+      value: string
+      hint?: string
+    }[]
+  >([])
+  const [groupOptions, setGroupOptions] = useState<
+    {
+      value: string
+    }[]
+  >([])
   useEffect(() => {
+    let live = true
     api
       .listSnapshots()
       .then((r) => {
-        setSnapshots(r.snapshots)
-        setSnapshot(r.snapshots[r.snapshots.length - 1] ?? '')
+        if (live) {
+          setSnapshots(r.snapshots)
+          setSnapshot(r.snapshots[r.snapshots.length - 1] ?? '')
+        }
       })
-      .catch((e) => setError(message(e)))
+      .catch((e) => {
+        if (live) setError(message(e))
+      })
+    api
+      .listInstances()
+      .then((r) => {
+        if (!live) return
+        setNodeOptions(
+          Object.entries(r)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([n, rec]) => ({
+              value: n,
+              hint: rec.schedule_mode === 'manual' ? 'manual-only' : undefined,
+            })),
+        )
+      })
+      .catch(() => {})
+    api
+      .listGroups()
+      .then((g) => {
+        if (live)
+          setGroupOptions(g.map((x) => ({ value: x.name })).sort((a, b) => a.value.localeCompare(b.value)))
+      })
+      .catch(() => {})
+    return () => {
+      live = false
+    }
   }, [])
   const body: RestoreItemRequest = {
     kind,
@@ -78,7 +119,9 @@ export function RestoreItemCard() {
               className={INPUT}
               value={kind}
               onChange={(e) => {
-                setKind(e.target.value as RestoreItemRequest['kind'])
+                const next = e.target.value as RestoreItemRequest['kind']
+                if ((next === 'group') !== (kind === 'group')) setName('')
+                setKind(next)
                 setPreview(null)
               }}
             >
@@ -87,17 +130,26 @@ export function RestoreItemCard() {
               <option value="group">A group</option>
             </select>
           </label>
-          <label className="text-sm text-slate-700">
-            {kind === 'group' ? 'Group name' : 'Instance name'}
-            <input
-              className={INPUT}
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value)
+          <div className="text-sm">
+            <MultiPicker
+              key={kind === 'group' ? 'group' : 'instance'}
+              label={kind === 'group' ? 'Group' : 'Instance'}
+              options={kind === 'group' ? groupOptions : nodeOptions}
+              selected={name ? [name] : []}
+              onChange={(next) => {
+                setName(next[0] ?? '')
                 setPreview(null)
               }}
+              placeholder={kind === 'group' ? 'Pick a group' : 'Pick an instance'}
+              emptyText={
+                kind === 'group'
+                  ? 'No groups now -- type a name to restore a deleted one'
+                  : 'No onboarded instances'
+              }
+              single
+              allowCustom
             />
-          </label>
+          </div>
           <label className="text-sm text-slate-700">
             Snapshot
             <select

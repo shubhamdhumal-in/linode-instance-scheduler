@@ -2171,7 +2171,8 @@ alone unless you include it. Stops run before starts, following each group's sta
 **Alerts.** Set a webhook (`LIS_ALERT_WEBHOOK_URL` — Slack and Teams incoming webhooks work as is)
 and/or email (`LIS_ALERT_EMAIL_TO` plus the `LIS_ALERT_SMTP_*` settings; see `DEPLOYMENT.md`
 §8.2) to hear about: the scheduler not checking in for 10 minutes, backups failing, the deployment
-SSH key not stored in every place, or nodes staying off their schedule. Each is sent when it
+SSH key not stored in every place, nodes staying off their schedule, or a node that keeps failing
+to start or stop (three failures in a row with no success since). Each is sent when it
 starts, every 6 hours while it lasts, and once when resolved. Linode blocks outbound SMTP ports on
 new accounts until support opens them.
 
@@ -2268,7 +2269,7 @@ python instance_manager.py rotate-credentials ssh-key --continue   # move nodes 
   bucket, and offered by every SSH connection alongside the new one (`LINODE_SSH_PREVIOUS_KEY_PATH`)
   — until every node trusts the new key. Running nodes move at once: the new key is added, a login
   with only the new key is proven, then the old key is removed. Stopped nodes move after their next
-  start; the scheduler does this, or run `--continue`. If you restore onto a new host part way
+  start; the scheduler does this, or run `--continue`. A node needing manual recovery is never started by the tool, so it can't move by itself: the old key stays trusted until it is recovered (`onboard --force` works during the rotation, since both keys are offered) or removed with `offboard`/`deregister`. The rotation reports such nodes separately and raises an alert, as it does when a node keeps failing to move or the rotation has been open for a week. If you restore onto a new host part way
   through, `ssh-key-restore` brings back the previous key too. If you use the assisted migration
   copy (§6.6), add the new public key to your profile's Lish keys yourself afterwards.
 

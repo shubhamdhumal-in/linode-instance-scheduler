@@ -6,6 +6,8 @@ export function MultiPicker({
   onChange,
   placeholder,
   emptyText,
+  single = false,
+  allowCustom = false,
 }: {
   label: string
   options: {
@@ -16,6 +18,8 @@ export function MultiPicker({
   onChange: (next: string[]) => void
   placeholder: string
   emptyText: string
+  single?: boolean
+  allowCustom?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -28,10 +32,21 @@ export function MultiPicker({
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [open])
-  const toggle = (value: string) =>
+  const toggle = (value: string) => {
+    if (single) {
+      onChange(selected.includes(value) ? [] : [value])
+      if (!selected.includes(value)) {
+        setOpen(false)
+        setQuery('')
+      }
+      return
+    }
     onChange(selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value])
+  }
   const q = query.trim().toLowerCase()
   const shown = options.filter((o) => !q || o.value.toLowerCase().includes(q))
+  const custom = query.trim()
+  const offerCustom = allowCustom && custom !== '' && !options.some((o) => o.value === custom)
   return (
     <div className="relative" ref={rootRef}>
       <span className="text-slate-700">{label}</span>
@@ -73,16 +88,30 @@ export function MultiPicker({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <ul className="max-h-56 overflow-auto py-1" role="listbox" aria-multiselectable="true">
-            {options.length === 0 && <li className="px-3 py-2 text-xs text-slate-500">{emptyText}</li>}
-            {options.length > 0 && shown.length === 0 && (
+          <ul className="max-h-56 overflow-auto py-1" role="listbox" aria-multiselectable={!single}>
+            {options.length === 0 && !offerCustom && (
+              <li className="px-3 py-2 text-xs text-slate-500">{emptyText}</li>
+            )}
+            {options.length > 0 && shown.length === 0 && !offerCustom && (
               <li className="px-3 py-2 text-xs text-slate-500">No match</li>
+            )}
+            {offerCustom && (
+              <li role="option" aria-selected={selected.includes(custom)}>
+                <button
+                  type="button"
+                  className="block w-full px-3 py-1 text-left text-sm hover:bg-slate-50"
+                  onClick={() => toggle(custom)}
+                >
+                  Use “<span className="font-medium">{custom}</span>”
+                  <span className="ml-1 text-xs text-slate-400">not in the current list</span>
+                </button>
+              </li>
             )}
             {shown.map((o) => (
               <li key={o.value} role="option" aria-selected={selected.includes(o.value)}>
                 <label className="flex cursor-pointer items-center gap-2 px-3 py-1 hover:bg-slate-50">
                   <input
-                    type="checkbox"
+                    type={single ? 'radio' : 'checkbox'}
                     checked={selected.includes(o.value)}
                     onChange={() => toggle(o.value)}
                   />

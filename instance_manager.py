@@ -8617,17 +8617,22 @@ def run_recovery_drill(client, *, region: str | None = None, keep_vm: bool = Fal
     if not region:
         raise engine.ConfigError("couldn't tell which region to use -- pass --region.")
     instance = None
+    drill_ips: set[str] = set()
     try:
         label = f"lis-drill-{started:%Y%m%d%H%M}"
         say(f"Creating a throwaway VM ({label}, {region})")
-        instance, _ = engine.retry_transient(lambda: client.linode.instance_create(
+        created = engine.retry_transient(lambda: client.linode.instance_create(
             "g6-nanode-1", region, image="linode/ubuntu24.04", label=label,
             root_pass=secrets.token_urlsafe(24), authorized_keys=[public],
             tags=[RECOVERY_DRILL_TAG]))
+
+
+        instance = created[0] if isinstance(created, tuple) else created
         result["vm_id"] = instance.id
         engine.poll_until_status(lambda: client.load(Instance, instance.id), ("running",),
                                  timeout_s=600)
         ip = client.load(Instance, instance.id).ipv4[0]
+        drill_ips.add(ip)
         engine.ssh_run(ip, str(key_path), "cloud-init status --wait >/dev/null 2>&1; true",
                        trust_new=True, retries=30, timeout_s=600)
         with tempfile.TemporaryDirectory() as tmp:
@@ -8664,12 +8669,20 @@ def run_recovery_drill(client, *, region: str | None = None, keep_vm: bool = Fal
                     client.load(Instance, instance.id).ipv4[0], str(key_path),
                     "tail -40 /root/drill.log", retries=1)[-4000:]
     finally:
-        if instance is not None and not keep_vm:
+        if not keep_vm:
+
+
             with contextlib_suppress(Exception):
-                engine.retry_transient(instance.delete)
-                result["vm_deleted"] = True
-            with contextlib_suppress(Exception):
-                engine.reset_known_host(client.load(Instance, instance.id).ipv4[0])
+                for inst in engine.retry_transient(lambda: list(client.linode.instances())):
+                    if RECOVERY_DRILL_TAG not in (inst.tags or []):
+                        continue
+                    with contextlib_suppress(Exception):
+                        drill_ips.update(str(a) for a in (inst.ipv4 or []))
+                    engine.retry_transient(inst.delete)
+                    result["vm_deleted"] = True
+            for drill_ip in drill_ips:
+                with contextlib_suppress(Exception):
+                    engine.reset_known_host(drill_ip)
     result["finished_at"] = datetime.now(UTC).isoformat()
     _record_drill(result)
     record_activity(f"recovery drill {'passed' if result['ok'] else 'FAILED'}"
@@ -8777,6 +8790,9 @@ class KeyRotationResult:
     moved: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+
+
+    blocked: list[str] = field(default_factory=list)
     finished: bool = False
     problems: list[str] = field(default_factory=list)
 
@@ -8850,6 +8866,7 @@ def rotate_deployment_ssh_key(client, *, on_progress: Callable[[str], None] | No
                     action="ssh-key-rotate")
     more = continue_key_rotation(client, on_progress=on_progress, on_warning=on_warning)
     result.moved, result.pending, result.failed = more.moved, more.pending, more.failed
+    result.blocked = more.blocked
     result.finished = more.finished
     result.problems += more.problems
     return result
@@ -8872,6 +8889,9 @@ def continue_key_rotation(client, *, on_progress: Callable[[str], None] | None =
         record = registry.get(name)
         if record is None:
             _set_rotation_node(name, "done", "no longer managed")
+            continue
+        if record.get("current_status") == "needs_manual_recovery":
+            result.blocked.append(name)
             continue
         if record.get("current_status") != "running" or record.get("transitioning"):
             result.pending.append(name)
@@ -8896,6 +8916,35 @@ def continue_key_rotation(client, *, on_progress: Callable[[str], None] | None =
         result.finished = True
         say("Every node trusts the new key; the old key is removed everywhere.")
     return result
+
+
+KEY_ROTATION_STALE_DAYS = 7
+
+
+def key_rotation_health(*, now: datetime | None = None) -> list[HealthProblem]:
+
+    rotation = key_rotation_state()
+    if rotation is None:
+        return []
+    now = now or datetime.now(UTC)
+    registry = load_registry()
+    open_nodes = [n for n in rotation["nodes"] if n["status"] != "done"]
+    blocked = [n["name"] for n in open_nodes
+               if (registry.get(n["name"]) or {}).get("current_status") == "needs_manual_recovery"]
+    failed = [n["name"] for n in open_nodes if n["status"] == "failed" and n["name"] not in blocked]
+    age_days = (now - datetime.fromisoformat(rotation["started_at"])).days
+    parts = []
+    if blocked:
+        parts.append(f"{', '.join(blocked)} need manual recovery and won't move by themselves "
+                     "(recover with `onboard --force`, or offboard/deregister)")
+    if failed:
+        parts.append(f"moving {', '.join(failed)} keeps failing")
+    if age_days >= KEY_ROTATION_STALE_DAYS and open_nodes:
+        parts.append(f"open for {age_days} days with {len(open_nodes)} node(s) still on the old key")
+    if not parts:
+        return []
+    return [HealthProblem("key-rotation", "the SSH key rotation isn't finishing, so the old key is "
+                          "still trusted: " + "; ".join(parts))]
 
 
 def _finish_key_rotation(client, rotation: dict) -> None:
@@ -9043,6 +9092,11 @@ def cmd_rotate_credentials(client, args) -> int:
             elif key_rotation_state() is not None:
                 print(f"Still to move (after their next start, automatically): "
                       f"{', '.join(result.pending + result.failed) or 'none'}")
+                if result.blocked:
+                    print(f"Won't move by themselves (needs manual recovery): "
+                          f"{', '.join(result.blocked)}. The old key stays trusted until each is "
+                          "recovered (`onboard --force` works during the rotation -- both keys are "
+                          "offered), or removed with `offboard`/`deregister`.")
             return 1 if result.failed else 0
         fn = {"api-token": rotate_api_token, "bucket-key": rotate_bucket_key,
               "oauth-secret": rotate_oauth_secret}[args.kind]
@@ -12578,6 +12632,15 @@ def check_health(*, now: datetime | None = None, include_scheduler: bool = True,
                 "schedule", f"{len(off)} node(s) off their schedule: "
                 + ", ".join(f"{m.name} ({m.current}, should be {m.desired})" for m in off[:10])))
     with contextlib_suppress(Exception):
+        problems += key_rotation_health(now=now)
+    with contextlib_suppress(Exception):
+        failing = find_failing_nodes(now=now)
+        if failing:
+            problems.append(HealthProblem(
+                "node-failing", f"{len(failing)} node(s) keep failing to start/stop: "
+                + "; ".join(f"{f['name']} ({f['failures']} failures in a row, last: "
+                            f"{f['last_error'][:120] or 'no detail'})" for f in failing[:10])))
+    with contextlib_suppress(Exception):
         if osb.is_configured():
             protection = _bucket_protection_cached(now)
             if protection.get("error"):
@@ -12870,6 +12933,35 @@ def find_schedule_mismatches(*, now: datetime | None = None,
             missed_at=missed_at.isoformat() if missed_at else None,
             changed_by_hand=by_hand, reason=reason))
     return mismatches
+
+
+FAILING_NODE_MIN_FAILURES = 3
+FAILING_NODE_LOOKBACK = timedelta(hours=24)
+
+
+def find_failing_nodes(*, now: datetime | None = None) -> list[dict]:
+
+    now = now or datetime.now(UTC)
+    failing = []
+    for name, record in sorted(load_registry().items()):
+        if record.get("current_status") == "needs_manual_recovery":
+            continue
+        streak: list[dict] = []
+        for event in get_schedule_events(name, limit=FAILING_NODE_MIN_FAILURES * 4):
+            if event["action"] not in ("create", "delete"):
+                continue
+            if event["result"] == "success":
+                break
+            streak.append(event)
+        if len(streak) < FAILING_NODE_MIN_FAILURES:
+            continue
+        newest = datetime.fromisoformat(streak[0]["timestamp"])
+        if now - newest > FAILING_NODE_LOOKBACK:
+            continue
+        failing.append({"name": name, "status": record.get("current_status"),
+                        "failures": len(streak), "last_failure_at": streak[0]["timestamp"],
+                        "last_error": (streak[0].get("error_message") or "")[:200]})
+    return failing
 
 
 def _changed_by_hand_since(name: str, since: datetime, current: str) -> bool:

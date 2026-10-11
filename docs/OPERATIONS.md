@@ -422,11 +422,12 @@ them in line after you confirm.
 
 With a webhook and/or email set up (the System backup page's Alerts form, `alerts-config`, or
 `LIS_ALERT_WEBHOOK_URL` / `LIS_ALERT_EMAIL_TO` + SMTP settings in `.env`), an alert goes out when the scheduler hasn't checked in for 10 minutes (sent by the API service), backups fail,
-the deployment SSH key isn't stored in every place, or nodes stay off their schedule — again every
+the deployment SSH key isn't stored in every place, nodes stay off their schedule, or a node keeps failing to start/stop (three failures in a row
+with no success since) — again every
 6 hours while it lasts, and once when resolved. Also covered: a failed daily restore test, the API
 token rejected or expiring within 14 days, the database disk nearly full, Shutdown Watchdog off on
 this host, this host standing by because another scheduler holds the lease, a pending deletion
-overdue or failing, bucket versioning that can't be turned on, a failed or missing recovery drill
+overdue or failing, bucket versioning that can't be turned on, an SSH key rotation that isn't finishing, a failed or missing recovery drill
 (when drills are on), and the host clock more than 60 seconds off Linode's API time or not
 time-synchronized (`timedatectl set-ntp true`). `alerts-test`
 sends a test message; `alerts-check` prints what needs attention and exits 1 if anything, for your
@@ -620,7 +621,7 @@ python instance_manager.py rotate-credentials ssh-key --continue   # move nodes 
 - `ssh-key`: the old key stays usable (encrypted in the database and bucket, and offered by every
   SSH connection via `LINODE_SSH_PREVIOUS_KEY_PATH`) until every node trusts the new key. Running
   nodes move at once — new key added, a login with only the new key proven, old key removed;
-  stopped nodes after their next start, which the scheduler handles. After a restore mid-rotation,
+  stopped nodes after their next start, which the scheduler handles. A node needing manual recovery is never started by the tool, so it can't move by itself: the old key stays trusted until it is recovered (`onboard --force` works during the rotation, since both keys are offered) or removed with `offboard`/`deregister`. The rotation reports such nodes separately and raises an alert, as it does when a node keeps failing to move or the rotation has been open for a week. After a restore mid-rotation,
   `ssh-key-restore` restores the previous key too. If you use the assisted migration copy, update
   the Lish key in your Linode profile to the new public key.
 
