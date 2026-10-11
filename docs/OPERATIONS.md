@@ -500,8 +500,9 @@ There's no separate metrics pipeline — the signal to watch is the tool's own s
 The dashboard's **Activity** page shows all of the below in one place, with a banner that turns
 red when the scheduler stops checking in; **Logs** tails the scheduler, API and backup output and
 each assisted migration copy's Rescue Mode console session (also on disk under `state/logs/`,
-`lish-<name>.log` for a console session); and **Console** runs any of the commands below from the
-browser.
+`lish-<name>.log` for a console session, removed automatically after `ACTIVITY_LOG_RETENTION_DAYS`
+days without new output, or sooner with **Delete session** or `console-session-delete --name X`);
+and **Console** runs any of the commands below from the browser.
 
 - **Are both processes actually running?** `systemctl is-active instance-scheduler-poll
   instance-scheduler-api`.

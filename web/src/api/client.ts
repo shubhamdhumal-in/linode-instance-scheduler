@@ -474,6 +474,10 @@ export const api = {
       'GET',
       `/logs/${encodeURIComponent(service)}?lines=${lines}${offset === null ? '' : `&offset=${offset}`}`,
     ),
+  deleteConsoleSession: (service: string) =>
+    request<{
+      deleted: string[]
+    }>('DELETE', `/logs/${encodeURIComponent(service)}`),
   listConsoleCommands: () =>
     request<{
       commands: string[]

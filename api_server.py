@@ -250,6 +250,7 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("DELETE", "/tokens/{token_name}"): "tokens:manage",
     ("GET", "/logs"): "logs:read",
     ("GET", "/logs/{service}"): "logs:read",
+    ("DELETE", "/logs/{service}"): "instances:migrate",
 }
 
 
@@ -2001,6 +2002,20 @@ def api_log_tail(
         return {"lines": tail, "offset": size, "reset": False}
 
 
+@app.delete("/logs/{service}")
+def api_delete_console_session(service: str, user: str = Depends(require_session)) -> dict:
+
+    if not _CONSOLE_SESSION_RE.fullmatch(service):
+        raise HTTPException(400, "only a migration console session (lish-<name>) can be deleted.")
+    name = service[len("lish-"):]
+    if not im.console_session_files(name):
+        raise HTTPException(404, f"no console session log for '{name}'.")
+    removed = im.delete_console_session(name)
+    im.record_activity(f"Deleted the console session log for '{name}'.", source="api",
+                       instance_name=name, action="console-session-delete", actor=user)
+    return {"deleted": removed}
+
+
 CONSOLE_COMMANDS = (
     "list", "status", "history", "start", "stop", "extend", "onboard", "offboard", "deregister",
     "migrate-start", "migrate-resume", "migrate-copy", "migrate-orphans", "schedule-set",
@@ -2010,7 +2025,7 @@ CONSOLE_COMMANDS = (
     "group-delete", "group-add", "group-remove", "api-token-list", "api-token-scopes",
     "api-token-revoke",
     "clear-lock", "set-vpc-address", "reset-host-key", "rebuild", "backup",
-    "backup-list", "rollback", "backup-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
+    "backup-list", "rollback", "backup-delete", "console-session-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
 )
 CONSOLE_MAX_RUNTIME_S = 3 * 3600
 CONSOLE_MAX_LINES = 20000

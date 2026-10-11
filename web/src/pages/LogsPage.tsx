@@ -38,6 +38,8 @@ export function LogsPage() {
   const [live, setLive] = useState(true)
   const [follow, setFollow] = useState(true)
   const [filter, setFilter] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const offsetRef = useRef<number | null>(null)
   const serviceRef = useRef(service)
   const boxRef = useRef<HTMLDivElement | null>(null)
@@ -53,6 +55,7 @@ export function LogsPage() {
   useEffect(() => {
     serviceRef.current = service
     offsetRef.current = null
+    setConfirmDelete(false)
     setLines(null)
     setError(null)
     api
@@ -102,6 +105,21 @@ export function LogsPage() {
     a.download = `${service}.log`
     a.click()
     URL.revokeObjectURL(url)
+  }
+  const deleteSession = async () => {
+    const target = service
+    setDeleting(true)
+    try {
+      await api.deleteConsoleSession(target)
+      setConfirmDelete(false)
+      if (serviceRef.current === target) setService('scheduler')
+      loadIndex()
+    } catch (e) {
+      if (serviceRef.current === target)
+        setError(e instanceof ApiError ? e.message : 'Could not delete the session log.')
+    } finally {
+      setDeleting(false)
+    }
   }
   const services =
     index?.services ??
@@ -166,10 +184,29 @@ export function LogsPage() {
           </div>
         )}
         {service.startsWith('lish-') && (
-          <p className="text-xs text-slate-500">
-            {logLabel(service)} — what the instance's Rescue Mode console showed while the tool ran the copy
-            (terminal codes removed).
-          </p>
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="text-xs text-slate-500">
+              {logLabel(service)} — what the instance's Rescue Mode console showed while the tool ran the copy
+              (terminal codes removed).
+              {index &&
+                ` Removed automatically after ${index.database.activity_retention_days} days without new output.`}
+            </p>
+            {confirmDelete ? (
+              <span className="ml-auto flex items-center gap-2 text-xs text-slate-700">
+                Delete this session log?
+                <Button variant="danger" onClick={deleteSession} disabled={deleting}>
+                  {deleting ? 'Deleting…' : 'Delete'}
+                </Button>
+                <Button variant="secondary" onClick={() => setConfirmDelete(false)} disabled={deleting}>
+                  Cancel
+                </Button>
+              </span>
+            ) : (
+              <Button variant="secondary" className="ml-auto" onClick={() => setConfirmDelete(true)}>
+                Delete session
+              </Button>
+            )}
+          </div>
         )}
         {error && <ErrorBanner message={error} />}
         <div

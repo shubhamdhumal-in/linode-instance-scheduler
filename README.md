@@ -259,6 +259,7 @@ Every command below is run from the repository root, with the virtual environmen
 | Command | What it does |
 |---|---|
 | `migrate-start` | **One-time, only for a node whose OS is still on local disk.** Starts moving it onto Block Storage — creates the destination volume and boots the node into Rescue Mode. Prints one manual command for you to run. |
+| `console-session-delete` | Delete a migration's Rescue Mode console session log (removed automatically after the retention period). See §6.6. |
 | `rollback` / `backup-list` / `backup-delete` | Put the original system back from the backup `migrate-start --backup` kept, list backups, or delete one when you no longer need it. See §6.5. |
 | `migrate-resume` | Finishes what `migrate-start` began, after you've run that one manual command. Boots the node from its new Block Storage volume and reserves its IP. |
 | `migrate-copy` | Optional: runs the copy step for you in the Rescue Mode console, then `migrate-resume`. Only when a pre-migration backup is kept (§6.6). |
@@ -593,6 +594,17 @@ dashboard, the migration's copy step shows **Run the copy for me** when a backup
 key is registered, or the setup steps above (with the key to paste) when it isn't. While the copy
 runs, **Watch the console session** opens it on the Logs page, updating live. After the copy it
 finishes the migration and onboards the instance, the same as the manual path.
+
+A session log is removed automatically once it has had no new output for
+`ACTIVITY_LOG_RETENTION_DAYS` days (30 by default; the scheduler checks hourly). To remove one
+sooner, select it on the Logs page and click **Delete session**, or run:
+
+```bash
+python instance_manager.py console-session-delete --name web-1
+```
+
+Deleting refuses (exit code 3) while anything holds the instance's lock, such as a copy that is
+still running.
 
 ## 7. Onboarding
 
@@ -1493,7 +1505,8 @@ scheduler host:
 - **Logs** — the raw output of the scheduler (`poll`), the API/dashboard server and backups,
   tailed live, plus the console's own log and the database file's size. Each assisted migration
   copy's Rescue Mode console session is listed there too (**Migration console sessions**), one per
-  instance, readable as plain text and updating live while a copy runs. Engine messages appear in
+  instance, readable as plain text and updating live while a copy runs. A session can be deleted
+  there (**Delete session**) and is removed automatically after the retention period. Engine messages appear in
   whichever service ran the operation. The same files are on disk under `state/logs/` (rotated at
   5 MB, three old files kept), so they work identically on a VM and on Kubernetes.
 - **Console** — runs this tool's own commands on the scheduler host with live output: `list`,

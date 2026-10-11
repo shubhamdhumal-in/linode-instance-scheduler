@@ -678,6 +678,7 @@ def write_scheduler_heartbeat(
         _retry_db(_do)
         if time.monotonic() - _last_activity_prune > _ACTIVITY_PRUNE_EVERY_S:
             _last_activity_prune = time.monotonic()
+            prune_console_sessions()
     except Exception:
         pass
 
@@ -9033,6 +9034,20 @@ def cmd_backup_list(args) -> int:
     return 0
 
 
+def cmd_console_session_delete(args) -> int:
+    try:
+        removed = delete_console_session(args.name)
+    except InstanceLockedError as e:
+        print(f"Refused: {e} A migration copy may still be writing this session.",
+              file=sys.stderr)
+        return 3
+    if not removed:
+        print(f"No console session log for '{args.name}'.")
+        return 0
+    print(f"Deleted the console session for '{args.name}' ({', '.join(removed)}).")
+    return 0
+
+
 def cmd_rollback(client, args) -> int:
     def _confirm() -> bool:
         if args.yes:
@@ -11417,6 +11432,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "backup-list", help="List pre-migration backups (migrate-start --backup).")
     backup_list_parser.add_argument("--json", action="store_true")
 
+    console_session_delete_parser = subparsers.add_parser(
+        "console-session-delete",
+        help="Delete a migration's Rescue Mode console session log (lish-<name>.log). Sessions "
+        "not written to for ACTIVITY_LOG_RETENTION_DAYS (default 30) are removed automatically.")
+    console_session_delete_parser.add_argument("--name", required=True,
+                                               type=validate_instance_name)
+
     rollback_parser = subparsers.add_parser(
         "rollback",
         help="Put the original system back from its pre-migration backup: the backup instance "
@@ -12060,6 +12082,47 @@ def service_log_dir() -> Path:
     return REGISTRY_PATH.parent / "logs"
 
 
+CONSOLE_SESSION_PREFIX = "lish-"
+
+
+def console_session_files(name: str) -> list[Path]:
+
+    base = service_log_dir() / f"{CONSOLE_SESSION_PREFIX}{name}.log"
+    return [p for p in (base, base.with_name(base.name + ".1")) if p.exists()]
+
+
+def delete_console_session(name: str) -> list[str]:
+
+    with _instance_lock(name):
+        removed = []
+        for path in console_session_files(name):
+            path.unlink(missing_ok=True)
+            removed.append(path.name)
+        return removed
+
+
+def prune_console_sessions(max_age_days: int | None = None) -> list[str]:
+
+    days = max_age_days if max_age_days is not None else activity_retention_days()
+    cutoff = time.time() - days * 86400
+    removed: list[str] = []
+    try:
+        paths = list(service_log_dir().glob(f"{CONSOLE_SESSION_PREFIX}*.log"))
+    except OSError:
+        return removed
+    for path in paths:
+        name = path.name[len(CONSOLE_SESSION_PREFIX):-len(".log")]
+        try:
+            files = console_session_files(name)
+            if not files or max(f.stat().st_mtime for f in files) >= cutoff:
+                continue
+            delete_console_session(name)
+            removed.append(name)
+        except Exception:
+            continue
+    return removed
+
+
 class _RotatingLogFile:
 
 
@@ -12185,6 +12248,8 @@ def _route(args) -> int:
         return cmd_deregister(args)
     if args.command == "backup-list":
         return cmd_backup_list(args)
+    if args.command == "console-session-delete":
+        return cmd_console_session_delete(args)
     if args.command == "backup-config":
         return cmd_backup_config(args)
     if args.command == "holiday-add":
