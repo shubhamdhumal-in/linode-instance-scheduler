@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
-import type { SystemBackupStatus } from '../api/types'
+import type { HealthStatus, SystemBackupStatus } from '../api/types'
 import { Button, Card, CardHeader, ErrorBanner, Spinner } from '../components/ui'
 import { useStatusBar } from '../status/StatusBarContext'
 import { PageHeader } from './DashboardLayout'
@@ -18,6 +18,7 @@ export function SystemBackupPage() {
   const [form, setForm] = useState({ bucket: '', endpoint: '', access_key: '', secret_key: '' })
   const [busy, setBusy] = useState<string | null>(null)
   const runningRef = useRef(false)
+  const [health, setHealth] = useState<HealthStatus | null>(null)
   const reload = useCallback(() => {
     api.getSystemBackup().then(
       (s) => {
@@ -26,6 +27,7 @@ export function SystemBackupPage() {
       },
       (e) => setError(message(e)),
     )
+    api.getHealth().then(setHealth, () => setHealth(null))
   }, [])
   useEffect(() => {
     reload()
@@ -241,6 +243,114 @@ export function SystemBackupPage() {
                     </div>
                   </form>
                 )}
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Backup on every change"
+                subtitle="A fresh database snapshot goes to Object Storage within a minute of any change (schedules, groups, starts and stops, tokens, activity), on top of the scheduled backup."
+              />
+              <div className="space-y-1 px-5 py-4 text-sm text-slate-700">
+                {!status.continuous?.enabled ? (
+                  <p className="text-amber-700">Off — it needs Object Storage (above).</p>
+                ) : (
+                  <>
+                    <p>
+                      Last upload:{' '}
+                      {status.continuous.last_backup_at
+                        ? new Date(status.continuous.last_backup_at).toLocaleString()
+                        : 'not yet'}
+                      {status.continuous.pending_changes > 0
+                        ? ` — ${status.continuous.pending_changes} change(s) waiting (uploaded by the scheduler within a minute)`
+                        : ' — up to date'}
+                    </p>
+                    {status.continuous.last_error && (
+                      <p className="text-rose-700">Last attempt failed: {status.continuous.last_error}</p>
+                    )}
+                  </>
+                )}
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Deployment SSH key"
+                subtitle="Every managed instance trusts this key. It's kept encrypted (passphrase in .env, LIS_SSH_KEY_PASSPHRASE) in the database and every backup, in Object Storage, and its public half in your Linode profile's SSH keys, so a replacement host can get it back."
+                action={
+                  <Button
+                    disabled={busy !== null}
+                    onClick={() =>
+                      act('protect', async () => {
+                        const r = await api.protectSshKey()
+                        return r.ok
+                          ? 'The deployment SSH key is stored in every place.'
+                          : `Not fully protected: ${r.problems.join('; ')}`
+                      })
+                    }
+                  >
+                    {busy === 'protect' ? 'Checking…' : 'Check now'}
+                  </Button>
+                }
+              />
+              <ul className="space-y-1 px-5 py-4 text-sm">
+                {(() => {
+                  const k = status.ssh_key
+                  const rows: [string, boolean][] = [
+                    ['Encryption passphrase set', !!k?.passphrase_set],
+                    ['Encrypted copy in the database (and every backup)', !!k?.stored_in_database],
+                    ['Encrypted copy in Object Storage', !!k?.in_object_storage],
+                    ['Public key in Linode SSH keys', !!k?.linode_ssh_key_id],
+                    [
+                      'Passphrase recovery copy in the Linode account (private StackScript)',
+                      !!k?.passphrase_escrowed,
+                    ],
+                  ]
+                  return rows.map(([label, ok]) => (
+                    <li key={label} className={ok ? 'text-emerald-700' : 'text-amber-700'}>
+                      {ok ? '✓' : '✗'} {label}
+                    </li>
+                  ))
+                })()}
+              </ul>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Alerts"
+                subtitle="Sent when the scheduler stops, backups fail, the deployment key isn't stored in every place, or nodes stay off their schedule; again every 6 hours while it lasts, and once when it's resolved. Channels are set in .env (LIS_ALERT_WEBHOOK_URL, LIS_ALERT_EMAIL_TO and the SMTP settings)."
+                action={
+                  <Button
+                    disabled={busy !== null || !(health?.alerts.webhook || health?.alerts.email)}
+                    onClick={() =>
+                      act('alert-test', async () => {
+                        const r = await api.testAlerts()
+                        const failed = Object.entries(r.results)
+                          .filter(([, ok]) => !ok)
+                          .map(([c]) => c)
+                        return failed.length
+                          ? `Test alert failed on: ${failed.join(', ')}`
+                          : 'Test alert sent.'
+                      })
+                    }
+                  >
+                    {busy === 'alert-test' ? 'Sending…' : 'Send test alert'}
+                  </Button>
+                }
+              />
+              <div className="space-y-2 px-5 py-4 text-sm text-slate-700">
+                <p>
+                  Webhook: {health?.alerts.webhook ? 'set' : 'not set'} · Email:{' '}
+                  {health?.alerts.email ? health.alerts.email_to.join(', ') : 'not set'}
+                </p>
+                {health && health.problems.length === 0 && (
+                  <p className="text-emerald-700">✓ Nothing needs attention.</p>
+                )}
+                {health?.problems.map((p) => (
+                  <p key={p.key} className="text-rose-700">
+                    ✗ {p.message}
+                  </p>
+                ))}
               </div>
             </Card>
 

@@ -7,6 +7,11 @@ import type {
   MigrationBackup,
   RollbackResult,
   SystemBackupStatus,
+  KeyProtectionResult,
+  HealthStatus,
+  ScheduleMismatch,
+  CatchUpResult,
+  MigrateAbandonResult,
   HookConfig,
   HookEvent,
   HookRunResult,
@@ -175,6 +180,42 @@ export const api = {
     }>('POST', `/instances/${encodeURIComponent(name)}/vpc-address`, { address, current }),
   deregisterInstance: (name: string) =>
     request<DeregisterResult>('POST', `/instances/${encodeURIComponent(name)}/deregister`),
+  clearLock: (name: string) =>
+    request<{
+      name: string
+      outcome: string
+    }>('POST', `/instances/${encodeURIComponent(name)}/clear-lock`),
+  abandonMigration: async (
+    name: string,
+    bootOriginal = true,
+    onProgress?: (percent: number, currentStep: string | null) => void,
+    onWarning?: (warnings: string[]) => void,
+  ) => {
+    const kickoff = await request<{
+      operation_id: string
+    }>('POST', `/instances/${encodeURIComponent(name)}/migrate-abandon`, { boot_original: bootOriginal })
+    return pollOperation<MigrateAbandonResult>(kickoff.operation_id, onProgress, onWarning)
+  },
+  getScheduleMismatches: () =>
+    request<{
+      mismatches: ScheduleMismatch[]
+    }>('GET', '/schedule/missed'),
+  applyScheduleCatchUp: async (
+    names: string[],
+    onProgress?: (percent: number, currentStep: string | null) => void,
+    onWarning?: (warnings: string[]) => void,
+  ) => {
+    const kickoff = await request<{
+      operation_id: string
+    }>('POST', '/schedule/missed/apply', { names })
+    return pollOperation<CatchUpResult>(kickoff.operation_id, onProgress, onWarning)
+  },
+  protectSshKey: () => request<KeyProtectionResult>('POST', '/system/ssh-key/protect'),
+  getHealth: () => request<HealthStatus>('GET', '/system/health'),
+  testAlerts: () =>
+    request<{
+      results: Record<string, boolean>
+    }>('POST', '/system/alerts/test'),
   getInstance: (name: string) =>
     request<InstanceRecord>('GET', `/instances/${encodeURIComponent(name)}/status`),
   getHistory: (name: string, limit = 50) =>

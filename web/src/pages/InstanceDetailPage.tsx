@@ -60,6 +60,7 @@ export function InstanceDetailPage() {
   } | null>(null)
   const [confirmName, setConfirmName] = useState('')
   const [deleteVolumes, setDeleteVolumes] = useState(false)
+  const [confirmClearLock, setConfirmClearLock] = useState(false)
   const [offboardError, setOffboardError] = useState<string | null>(null)
   const [offboardErrorWarnings, setOffboardErrorWarnings] = useState<string[] | null>(null)
   const [offboardSuccessWarnings, setOffboardSuccessWarnings] = useState<string[] | null>(null)
@@ -72,6 +73,7 @@ export function InstanceDetailPage() {
   useEffect(() => {
     currentNameRef.current = name
     setDeleteVolumes(false)
+    setConfirmClearLock(false)
     setConfirmName('')
     setStopConfirming(false)
     setStopConfirmName('')
@@ -349,6 +351,39 @@ export function InstanceDetailPage() {
               <div className="mx-5 mb-4 rounded-md bg-red-50 px-4 py-3 text-sm text-red-800 ring-1 ring-inset ring-red-200">
                 Only partially recovered by `rebuild` -- boot it once manually via Cloud Manager from its
                 os_volume_id, then re-run onboard to fully restore management before Start/Stop will work.
+              </div>
+            )}
+            {record.transitioning && (
+              <div className="mx-5 mb-4 space-y-3 rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-inset ring-amber-200">
+                <p>
+                  A start or stop is marked as in progress. If none is really running (for example the
+                  scheduler host restarted in the middle of one), clear the mark. Clearing is refused while a
+                  start or stop really is running, and the scheduler clears a stale mark by itself within a
+                  few minutes.
+                </p>
+                {confirmClearLock ? (
+                  <div className="flex gap-2">
+                    <Button
+                      variant="danger"
+                      disabled={busy !== null}
+                      onClick={() => {
+                        setConfirmClearLock(false)
+                        run('clear lock', async () => {
+                          const result = await api.clearLock(name)
+                          if (result.outcome === 'aborted_by_user') throw new Error('Not cleared.')
+                          return result
+                        })
+                      }}
+                    >
+                      {busy === 'clear lock' ? 'Clearing…' : 'Yes, clear the mark'}
+                    </Button>
+                    <Button onClick={() => setConfirmClearLock(false)}>Cancel</Button>
+                  </div>
+                ) : (
+                  <Button disabled={busy !== null} onClick={() => setConfirmClearLock(true)}>
+                    Clear lock
+                  </Button>
+                )}
               </div>
             )}
             <div className="flex flex-wrap items-start gap-2 px-5 pb-5">

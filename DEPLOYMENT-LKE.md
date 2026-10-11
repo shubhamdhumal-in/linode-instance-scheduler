@@ -89,13 +89,18 @@ each one is and where to create it in Cloud Manager.
 
 ```
 cd k8s
-cp secret.example.yaml secret.yaml               # LINODE_API_TOKEN, OAuth, Object Storage
+cp secret.example.yaml secret.yaml               # LINODE_API_TOKEN, OAuth, Object Storage, key passphrase, alerts
 cp ssh-key-secret.example.yaml ssh-key-secret.yaml   # the deployment's own SSH private key
 ```
 
 Edit both with real values (or, better, create them directly from the command line instead
 of ever writing real credentials to a file — see each template's own header comment for the
 exact `kubectl create secret` command). Both files are gitignored; never commit them.
+
+Set `LIS_SSH_KEY_PASSPHRASE` to a new random value of 12+ characters (`openssl rand -base64 24`).
+It encrypts the stored copies of the deployment SSH key; the scheduler keeps its recovery copy in a
+private StackScript in your Linode account, so the API token needs StackScripts read/write. The
+optional `LIS_ALERT_*` values turn on webhook and email alerts (see `DEPLOYMENT.md` §8.2).
 
 `configmap.example.yaml` holds only non-secret tunables (poll interval/window, optional CORS
 origins) — copy it to `configmap.yaml` if you want to change the defaults, otherwise
@@ -201,6 +206,14 @@ becomes an unattached volume in your account, recoverable by hand if you ever ne
 rather than gone. That's a safety net on top of, not a replacement for, `rebuild`/Object
 Storage — treat total loss of the PVC the same way the VM guide already treats total loss of
 `state/instances.db`.
+
+Everything else in the VM guide's §8 applies unchanged: with Object Storage configured, a snapshot
+is uploaded within a minute of every change and old ones are pruned; the deployment SSH key is kept
+encrypted in the database and Object Storage (passphrase recoverable from your Linode account);
+the scheduler compares every node with the account every few minutes (`heal`); nodes left off
+their schedule after an outage are listed for approval (`schedule-catch-up`); and alerts reach your
+webhook or email. To move to a new cluster, deploy as usual with an empty PVC, then from the pod:
+`ssh-key-restore --save-passphrase` (if the key Secret is gone), `restore`, `rebuild`, `heal`.
 
 ---
 

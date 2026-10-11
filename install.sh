@@ -18,7 +18,8 @@ ENV_FILE_IN=""
 SSH_KEY_IN=""
 SSH_KEY_FROM_BACKUP=0
 NEW_SSH_KEY=0
-BACKUP_SSH_KEY=0
+NEW_PASSPHRASE=""
+KEY_FROM_SNAPSHOT=0
 PASSPHRASE_FILE=""
 WITH_API=1
 API_PORT=8000
@@ -66,12 +67,12 @@ Options:
   --env-file PATH           Use this .env instead of prompting for credentials
   --ssh-key PATH            The deployment SSH private key to use. install: optional (one is
                             generated if not given). recover: the ORIGINAL key from the old host
-  --ssh-key-from-backup     recover: fetch the key stored by `ssh-key-backup` from Object Storage
-                            (asks for its passphrase)
+  --ssh-key-from-backup     recover: fetch the stored key from Object Storage (also the default
+                            when no --ssh-key is given: Object Storage, then the restored database)
   --new-ssh-key             recover: generate a new key instead. Only if the old one is truly
                             gone -- managed instances won't trust it until you add it to each one
-  --backup-ssh-key          install: also store the key in Object Storage, encrypted with a
-                            passphrase you choose, so `recover --ssh-key-from-backup` works later
+  --backup-ssh-key          (kept for older scripts -- the key is now always stored encrypted, in the
+                            database, Object Storage and your Linode profile's SSH keys)
   --passphrase-file PATH    Read that passphrase from a file instead of prompting
   --no-api                  Don't install the REST API / dashboard service
   --api-port PORT           API port on 127.0.0.1 (default 8000)
@@ -103,7 +104,7 @@ while [[ $# -gt 0 ]]; do
     --ssh-key) SSH_KEY_IN="$2"; shift 2 ;;
     --ssh-key-from-backup) SSH_KEY_FROM_BACKUP=1; shift ;;
     --new-ssh-key) NEW_SSH_KEY=1; shift ;;
-    --backup-ssh-key) BACKUP_SSH_KEY=1; shift ;;
+    --backup-ssh-key) shift ;;  # the key is always stored now; kept for older scripts
     --passphrase-file) PASSPHRASE_FILE="$2"; shift 2 ;;
     --no-api) WITH_API=0; shift ;;
     --api-port) API_PORT="$2"; shift 2 ;;
@@ -307,6 +308,18 @@ configure_env() {
     warn "LINODE_OAUTH_REDIRECT_URI doesn't match https://$DOMAIN/oauth/callback -- login only works when the OAuth app's callback URL, .env and the domain all agree."
   fi
   stage_set LINODE_SSH_KEY_PATH "$KEY_PATH"
+  # The passphrase that encrypts the stored copies of the deployment SSH key. Generated once on a
+  # first install (shown once at the end); on recovery it must be the original one.
+  if ! stage_has LIS_SSH_KEY_PASSPHRASE; then
+    if [[ "$MODE" == "install" ]]; then
+      NEW_PASSPHRASE=$(head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | cut -c1-32)
+      stage_set LIS_SSH_KEY_PASSPHRASE "$NEW_PASSPHRASE"
+    elif [[ $ASSUME_YES -eq 0 ]]; then
+      local pp
+      pp=$(ask_secret "SSH key passphrase from the original install (blank: fetch it from your Linode account)")
+      [[ -n "$pp" ]] && stage_set LIS_SSH_KEY_PASSPHRASE "$pp"
+    fi
+  fi
 
   stage_has LINODE_API_TOKEN || { cleanup_env_stage; die "LINODE_API_TOKEN is empty"; }
   if stage_obj_partial; then
@@ -342,8 +355,10 @@ run_with_passphrase() {  # run an im command that may read a passphrase
     local copy; copy=$(mktemp); cp "$PASSPHRASE_FILE" "$copy"; chown "$SERVICE_USER" "$copy"; chmod 600 "$copy"
     im "${args[@]}" --passphrase-file "$copy" || { rm -f "$copy"; return 1; }
     rm -f "$copy"
-  else
+  elif { true </dev/tty; } 2>/dev/null; then
     im "${args[@]}" </dev/tty
+  else
+    im "${args[@]}" </dev/null   # no terminal: the passphrase must come from .env or the escrow
   fi
 }
 
@@ -369,14 +384,38 @@ setup_ssh_key() {
   elif [[ -f "$KEY_PATH" ]]; then
     log "Keeping the existing deployment SSH key"
   elif [[ "$MODE" == "recover" && $NEW_SSH_KEY -eq 0 ]]; then
-    die "recovery needs the ORIGINAL deployment SSH key -- managed instances only trust that key.
-    Give it with --ssh-key PATH, or --ssh-key-from-backup if \`ssh-key-backup\` was run on the old
-    host. Only if it is truly lost: --new-ssh-key (then add the new public key to every instance)."
+    # The ORIGINAL key is needed: managed instances only trust it. Try the encrypted copy in Object
+    # Storage now; if that isn't there, the copy inside the database snapshot is tried once the
+    # snapshot is restored (fetch_key_from_snapshot).
+    if obj_configured && run_with_passphrase ssh-key-restore --ssh-key "$KEY_PATH" --force --save-passphrase; then
+      log "Fetched the deployment SSH key from Object Storage"
+    else
+      KEY_FROM_SNAPSHOT=1
+      log "The deployment SSH key will be taken from the restored database"
+      return 0
+    fi
   else
     log "Generating a new deployment SSH key"
     runuser -u "$SERVICE_USER" -- ssh-keygen -q -t ed25519 -N "" -C "linode-instance-scheduler@$(hostname)" -f "$KEY_PATH"
   fi
   chmod 600 "$KEY_PATH"
+}
+
+fetch_key_from_snapshot() {
+  [[ $KEY_FROM_SNAPSHOT -eq 1 ]] || return 0
+  if run_with_passphrase ssh-key-restore --from-db --ssh-key "$KEY_PATH" --force --save-passphrase; then
+    chmod 600 "$KEY_PATH"
+    return 0
+  fi
+  die "the ORIGINAL deployment SSH key couldn't be recovered -- managed instances only trust it.
+    Give it with --ssh-key PATH (or put the right passphrase in .env as LIS_SSH_KEY_PASSPHRASE).
+    Only if it is truly lost: --new-ssh-key (then add the new public key to every instance, e.g.
+    from Lish or rescue mode). Your instances and their data are not affected either way."
+}
+
+protect_ssh_key() {
+  log "Storing the deployment SSH key encrypted (database, Object Storage, Linode SSH keys)"
+  im ssh-key-protect --ssh-key "$KEY_PATH" || warn "the deployment SSH key isn't fully protected yet (see above); the scheduler retries every hour"
 }
 
 # --- dashboard ------------------------------------------------------------------------------------
@@ -620,11 +659,7 @@ do_install() {
   configure_env
   check_token
   setup_ssh_key
-  if [[ $BACKUP_SSH_KEY -eq 1 ]]; then
-    obj_configured || die "--backup-ssh-key needs Object Storage settings"
-    log "Storing the SSH key in Object Storage, encrypted (choose a passphrase and keep it safe)"
-    run_with_passphrase ssh-key-backup --ssh-key "$KEY_PATH" || die "couldn't store the SSH key"
-  fi
+  protect_ssh_key
   build_dashboard
   write_units
   start_services
@@ -643,7 +678,12 @@ $(sed 's/^/    /' "$KEY_PATH.pub" 2>/dev/null)
   Logs:  the dashboard's Activity and Logs pages, $INSTALL_DIR/state/logs/, or journalctl -u $POLL_UNIT -f
 EOF
   obj_configured || warn "Object Storage isn't configured: only local snapshots in $BACKUP_DIR are kept, and they're lost with this host. Copy them off-host, or configure Object Storage and re-run install."
-  [[ $BACKUP_SSH_KEY -eq 1 ]] || warn "recovering on a new host needs $KEY_PATH -- keep a copy somewhere safe, or store it encrypted with --backup-ssh-key (skip this if you already did)."
+  if [[ -n "$NEW_PASSPHRASE" ]]; then
+    printf '\n  Deployment SSH key passphrase (shown once; also in %s/.env as LIS_SSH_KEY_PASSPHRASE):\n\n      %s\n\n' "$INSTALL_DIR" "$NEW_PASSPHRASE"
+    printf '  The key is stored encrypted with it in the database, every backup and Object Storage, and the\n'
+    printf '  passphrase itself in a private StackScript in your Linode account, so a replacement host\n'
+    printf '  fetches it with your API token. Keeping your own copy too is a good idea.\n'
+  fi
 }
 
 do_recover() {
@@ -689,8 +729,13 @@ EOF
     { [[ -n "$KNOWN_HOSTS_IN" ]] || obj_configured; } && { im "${hosts_args[@]}" || warn "couldn't restore the trusted host keys"; }
   fi
 
+  fetch_key_from_snapshot
+  protect_ssh_key
+
   log "Rebuilding from Linode tags and Object Storage (adds anything newer than the snapshot)"
   im rebuild --ssh-key "$KEY_PATH" || warn "rebuild reported names it couldn't fully recover (see above)"
+  log "Comparing every node with the account (adopts instances the snapshot doesn't know about)"
+  im heal || warn "the self-healing check reported problems (see above)"
 
   if [[ $NO_START -eq 1 ]]; then
     log "Recovered, services NOT started (--no-start). Managed instances:"
@@ -703,6 +748,7 @@ EOF
     run_backup
     log "Recovery complete. Managed instances:"
     im list || true
+    catch_up_schedules
   fi
   cat <<EOF
 
@@ -719,6 +765,20 @@ EOF
   return 0
 }
 
+catch_up_schedules() {
+  # Nodes left in the wrong state by the outage (beyond the scheduler's one-hour catch-up window):
+  # shown for review, started/stopped only after a yes.
+  echo
+  im schedule-catch-up || return 0
+  if im schedule-catch-up --json 2>/dev/null | grep -q '"name"'; then
+    if [[ $ASSUME_YES -eq 0 ]] && confirm "Start/stop these now to match their schedule?"; then
+      im schedule-catch-up --apply --yes --ssh-key "$KEY_PATH" || warn "some nodes didn't reach their scheduled state (see above)"
+    else
+      echo "  Left as they are. Review on the dashboard's Instances page, or: instance_manager.py schedule-catch-up"
+    fi
+  fi
+}
+
 do_status() {
   for u in "$POLL_UNIT.service" "$API_UNIT.service" "$BACKUP_UNIT.timer"; do
     printf '  %-36s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"
@@ -732,7 +792,7 @@ do_status() {
 case "$MODE" in
   install) do_install ;;
   recover) do_recover ;;
-  start) [[ -x "$PY" ]] || die "not installed in $INSTALL_DIR"; [[ -f "$UNIT_DIR/$API_UNIT.service" ]] || WITH_API=0; start_services; run_backup ;;
+  start) [[ -x "$PY" ]] || die "not installed in $INSTALL_DIR"; [[ -f "$UNIT_DIR/$API_UNIT.service" ]] || WITH_API=0; start_services; run_backup; catch_up_schedules ;;
   backup-now) [[ -x "$PY" ]] || die "not installed in $INSTALL_DIR"; run_backup ;;
   status) [[ -x "$PY" ]] || die "not installed in $INSTALL_DIR"; do_status ;;
 esac

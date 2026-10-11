@@ -242,8 +242,12 @@ def snapshot_database(db_path: Path, dest_path: Path) -> None:
         source.close()
 
 
+CONTINUOUS_SNAPSHOT_KEY = "full-backups/instances-continuous.db"
+
+
 def upload_database_snapshot(
-    db_path: Path, *, attempts: int = DEFAULT_ATTEMPTS, delay_s: float = DEFAULT_DELAY_S
+    db_path: Path, *, attempts: int = DEFAULT_ATTEMPTS, delay_s: float = DEFAULT_DELAY_S,
+    key: str | None = None,
 ) -> str:
 
     client = build_object_storage_client()
@@ -257,7 +261,10 @@ def upload_database_snapshot(
         body = tmp_path.read_bytes()
 
     md5_hex = hashlib.md5(body).hexdigest()
-    key = f"full-backups/instances-{int(time.time())}.db"
+
+
+    if key is None:
+        key = f"full-backups/instances-{int(time.time())}.db"
 
     def _do():
         response = client.put_object(
@@ -287,7 +294,7 @@ def list_database_snapshots() -> list[str] | None:
     client = build_object_storage_client()
     if client is None:
         return None
-    keys: list[str] = []
+    found: list[tuple[str, float]] = []
     token = None
     try:
         while True:
@@ -295,18 +302,62 @@ def list_database_snapshots() -> list[str] | None:
             if token:
                 kwargs["ContinuationToken"] = token
             page = _retry(lambda kwargs=kwargs: client.list_objects_v2(**kwargs))
-            keys += [o["Key"] for o in page.get("Contents", []) or [] if o.get("Key", "").endswith(".db")]
+            for o in page.get("Contents", []) or []:
+                key = o.get("Key", "")
+                if not key.endswith(".db"):
+                    continue
+                modified = o.get("LastModified")
+                found.append((key, modified.timestamp() if hasattr(modified, "timestamp") else 0.0))
             if not page.get("IsTruncated"):
                 break
             token = page.get("NextContinuationToken")
     except (ClientError, BotoCoreError, ObjectStorageError):
         return None
 
-    def _ts(key: str) -> int:
+    def _ts(item: tuple[str, float]) -> float:
+        key, modified = item
         stem = key[len(_SNAPSHOT_PREFIX):].removeprefix("instances-").removesuffix(".db")
-        return int(stem) if stem.isdigit() else 0
+        return float(stem) if stem.isdigit() else modified
 
-    return sorted(keys, key=lambda k: (_ts(k), k))
+    return [key for key, _ in sorted(found, key=lambda item: (_ts(item), item[0]))]
+
+
+def prune_database_snapshots(*, keep_all_hours: int = 48, keep_daily_days: int = 30,
+                             now: float | None = None) -> list[str]:
+
+    keys = list_database_snapshots()
+    if not keys:
+        return []
+    client = build_object_storage_client()
+    now = time.time() if now is None else now
+    stamped = []
+    for key in keys:
+        stem = key[len(_SNAPSHOT_PREFIX):].removeprefix("instances-").removesuffix(".db")
+        if stem.isdigit():
+            stamped.append((int(stem), key))
+    if not stamped:
+        return []
+    stamped.sort()
+    newest = stamped[-1][1]
+    keep: set[str] = {newest}
+    newest_of_day: dict[str, str] = {}
+    for ts, key in stamped:
+        age = now - ts
+        if age <= keep_all_hours * 3600:
+            keep.add(key)
+        elif age <= keep_daily_days * 86400:
+            newest_of_day[time.strftime("%Y-%m-%d", time.gmtime(ts))] = key
+    keep.update(newest_of_day.values())
+    deleted = []
+    for _ts, key in stamped:
+        if key in keep:
+            continue
+        try:
+            _retry(lambda key=key: client.delete_object(Bucket=_cached_bucket, Key=key))
+            deleted.append(key)
+        except (ClientError, BotoCoreError, ObjectStorageError):
+            continue
+    return deleted
 
 
 def _get_verified(key: str) -> bytes:
@@ -375,6 +426,11 @@ def download_deployment_file(name: str) -> bytes | None:
     if stored_md5 and hashlib.md5(body).hexdigest() != stored_md5:
         raise ObjectStorageError(f"'{key}' failed its checksum -- not using it.")
     return body
+
+
+def list_instance_backups() -> list[str] | None:
+
+    return _list_record_names("instances/")
 
 
 def download_instance_backup(name: str) -> dict | None:

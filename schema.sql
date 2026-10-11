@@ -184,3 +184,31 @@ CREATE TABLE IF NOT EXISTS holidays (
     created_at TIMESTAMP NOT NULL,
     PRIMARY KEY (date, scope, target)
 );
+
+CREATE TABLE IF NOT EXISTS deployment_secrets (
+    name TEXT PRIMARY KEY,
+    blob BLOB NOT NULL,
+    fingerprint TEXT NOT NULL,
+    public_key TEXT,
+    object_storage_fingerprint TEXT,
+    linode_ssh_key_id INTEGER,
+    escrow_stackscript_id INTEGER,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS continuous_backup (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    changes INTEGER NOT NULL DEFAULT 0,
+    backed_up INTEGER NOT NULL DEFAULT 0,
+    last_backup_at TEXT,
+    last_attempt_at TEXT,
+    last_key TEXT,
+    last_error TEXT
+);
+INSERT OR IGNORE INTO continuous_backup (id, changes, backed_up) VALUES (1, 0, 0);
+
+CREATE TABLE IF NOT EXISTS alert_state (
+    key TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    last_sent_at TEXT
+);

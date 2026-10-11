@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import ipaddress
 import os
@@ -83,6 +84,9 @@ def _sweep_old_oauth_states_locked() -> None:
         del _pending_oauth_states[s]
 
 
+ALERT_CHECK_INTERVAL_S = 300
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -91,7 +95,22 @@ async def lifespan(app: FastAPI):
     app.state.ssh_key = os.environ.get(
         "LINODE_SSH_KEY_PATH", str(Path.home() / ".ssh" / "linode_spike_key"),
     )
+
+
+    stop_alerts = threading.Event()
+
+    def _alert_loop() -> None:
+        if stop_alerts.wait(60):
+            return
+        while True:
+            with contextlib.suppress(Exception):
+                im.evaluate_alerts(include_scheduler=True)
+            if stop_alerts.wait(ALERT_CHECK_INTERVAL_S):
+                return
+
+    threading.Thread(target=_alert_loop, daemon=True, name="alert-check").start()
     yield
+    stop_alerts.set()
 
 
 app = FastAPI(
@@ -244,6 +263,11 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("DELETE", "/backups/{name}"): "instances:migrate",
     ("POST", "/instances/{name}/offboard"): "instances:offboard",
     ("POST", "/instances/{name}/deregister"): "instances:offboard",
+    ("POST", "/instances/{name}/clear-lock"): "instances:clear-lock",
+    ("POST", "/instances/{name}/migrate-abandon"): "instances:migrate",
+    ("GET", "/schedule/missed"): "schedules:read",
+    ("POST", "/schedule/missed/apply"): "schedules:catch-up",
+    ("GET", "/system/health"): "activity:read",
     ("POST", "/instances/{name}/vpc-address"): "instances:vpc-address",
     ("POST", "/tokens"): "tokens:manage",
     ("GET", "/tokens"): "tokens:manage",
@@ -256,7 +280,7 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
 
 _LIMITED_TOKEN_OPEN_ROUTES = {
     ("GET", "/instances"), ("GET", "/groups"), ("GET", "/operations/{op_id}"),
-    ("GET", "/activity"),
+    ("GET", "/activity"), ("GET", "/schedule/missed"), ("POST", "/schedule/missed/apply"),
 }
 
 
@@ -320,6 +344,14 @@ def require_session(
 def _limited_token(request: Request) -> dict | None:
     meta = getattr(request.state, "api_token", None)
     return meta if meta is not None and _token_is_limited(meta) else None
+
+
+def _visible_instance_names(request: Request) -> list[str] | None:
+
+    meta = _limited_token(request)
+    if meta is None:
+        return None
+    return [n for n in im.load_registry() if im.api_token_allows_instance(meta, n)]
 
 
 @app.get("/health")
@@ -1025,6 +1057,108 @@ def api_deregister(name: str, user: str = Depends(require_session)) -> dict:
 
     result = im.deregister_instance(name)
     return _asdict(result)
+
+
+@app.post("/instances/{name}/clear-lock")
+def api_clear_lock(name: str, user: str = Depends(require_session)) -> dict:
+
+    result = im.clear_instance_lock(name)
+    im.record_activity(f"in-progress mark {result.outcome.replace('_', ' ')}", source="api",
+                       instance_name=name, action="clear-lock", actor=user)
+    return {"name": name, "outcome": result.outcome}
+
+
+class MigrateAbandonRequest(BaseModel):
+    boot_original: bool = True
+
+
+@app.post("/instances/{name}/migrate-abandon")
+def api_migrate_abandon(name: str, request: Request, body: MigrateAbandonRequest | None = None,
+                        wait: bool = False, user: str = Depends(require_session)) -> JSONResponse:
+
+    client = _client(request)
+    boot = body.boot_original if body is not None else True
+
+    def _do(op_id: str) -> im.MigrateAbandonResult:
+        return im.abandon_migration(client, name, boot_original=boot, actor=user,
+                                    on_progress=_make_progress_reporter(op_id),
+                                    on_warning=_make_warning_reporter(op_id))
+
+    return _kickoff("migrate_abandon", 4, _do, wait, actor=user)
+
+
+@app.post("/system/heal")
+def api_heal(request: Request, user: str = Depends(require_session)) -> dict:
+
+    result = im.reconcile_fleet(_client(request))
+    return dataclasses.asdict(result)
+
+
+@app.post("/system/ssh-key/protect")
+def api_protect_ssh_key(request: Request, user: str = Depends(require_session)) -> dict:
+
+    result = im.protect_deployment_ssh_key(_client(request), im.deployment_ssh_key_path())
+    return {**dataclasses.asdict(result), "ok": result.ok}
+
+
+@app.get("/system/health")
+def api_health_problems(user: str = Depends(require_session)) -> dict:
+
+    channels = im.alert_channels()
+    return {"problems": [dataclasses.asdict(p) for p in im.check_health()],
+            "alerts": {"webhook": channels["webhook"], "email": channels["email"],
+                       "email_to": channels["email_to"]}}
+
+
+@app.post("/system/alerts/test")
+def api_alerts_test(user: str = Depends(require_session)) -> dict:
+
+    channels = im.alert_channels()
+    if not channels["webhook"] and not channels["email"]:
+        raise HTTPException(400, f"no alert channel set up -- set {im.ALERT_WEBHOOK_ENV} and/or "
+                                 f"{im.ALERT_EMAIL_ENV} plus LIS_ALERT_SMTP_HOST in .env.")
+    text = "Linode Instance Scheduler: test alert -- alerts reach this channel."
+    results = {}
+    if channels["webhook"]:
+        results["webhook"] = im._send_webhook(text, "test", {"status": "test"})
+    if channels["email"]:
+        results["email"] = im._send_email(text, "test", {"status": "test"})
+    return {"results": results}
+
+
+@app.get("/schedule/missed")
+def api_schedule_missed(request: Request, user: str = Depends(require_session)) -> dict:
+
+    names = _visible_instance_names(request)
+    return {"mismatches": [dataclasses.asdict(m) for m in im.find_schedule_mismatches(names=names)]}
+
+
+class CatchUpRequest(BaseModel):
+    names: list[str]
+
+
+@app.post("/schedule/missed/apply")
+def api_schedule_missed_apply(body: CatchUpRequest, request: Request, wait: bool = False,
+                              user: str = Depends(require_session)) -> JSONResponse:
+
+    allowed = _visible_instance_names(request)
+    if allowed is not None:
+        outside = sorted(set(body.names) - set(allowed))
+        if outside:
+            raise HTTPException(403, f"this token doesn't cover: {', '.join(outside)}")
+    for n in body.names:
+        im.validate_instance_name(n)
+    client, ssh_key = _client(request), _ssh_key(request)
+
+    def _do(op_id: str) -> im.CatchUpResult:
+        return im.apply_schedule_catch_up(
+            client, ssh_key, body.names, actor=user,
+            max_parallel=min(5, max(1, len(body.names))),
+            client_factory=im._per_thread_client_factory() if len(body.names) > 1 else None,
+            on_progress=_make_progress_reporter(op_id),
+            on_warning=_make_warning_reporter(op_id))
+
+    return _kickoff("schedule_catch_up", max(1, len(body.names)), _do, wait, actor=user)
 
 
 @app.get("/instances/{name}/status")
@@ -2024,7 +2158,8 @@ CONSOLE_COMMANDS = (
     "group-create", "group-schedule-set", "group-show", "group-list", "group-depends",
     "group-delete", "group-add", "group-remove", "api-token-list", "api-token-scopes",
     "api-token-revoke",
-    "clear-lock", "set-vpc-address", "reset-host-key", "rebuild", "backup",
+    "clear-lock", "set-vpc-address", "reset-host-key", "rebuild", "backup", "heal",
+    "migrate-abandon", "schedule-catch-up", "ssh-key-protect",
     "backup-list", "rollback", "backup-delete", "console-session-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
 )
 CONSOLE_MAX_RUNTIME_S = 3 * 3600

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import type { InstanceRecord } from '../api/types'
+import { MissedScheduleCard } from '../components/MissedScheduleCard'
 import { StatusBadge } from '../components/StatusBadge'
 import { Button, Card, EmptyState, ErrorBanner, Spinner } from '../components/ui'
 import { usePolling } from '../hooks/usePolling'
@@ -39,6 +40,7 @@ export function InstancesPage() {
         }
       />
       <div className="p-8">
+        <MissedScheduleCard onApplied={reload} />
         {error && <ErrorBanner message={error} />}
         {!error && instances === null && (
           <div className="flex justify-center py-16">

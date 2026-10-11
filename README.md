@@ -290,7 +290,11 @@ Every command below is run from the repository root, with the virtual environmen
 | `hooks-show` | Shows a node's own hooks and the ones that actually apply to it (its own, or inherited from its group), or a group's hooks. |
 | `hooks-clear` | Removes a node's own hooks (its group's then apply), or a group's hooks. |
 | `hooks-run` | Runs a node's hook right now, without starting or stopping it — to test a hook, or re-run a failed post-start check after fixing the cause. |
-| `clear-lock` | Admin escape hatch — forcibly clears a stuck in-progress operation. You should rarely need this. |
+| `clear-lock` | Admin escape hatch — forcibly clears a stuck in-progress operation. You should rarely need this: the scheduler clears a stale one by itself, and the dashboard has a **Clear lock** button. |
+| `heal` | Compares every node with your account and fixes the local records where the account proves them wrong (an instance the records don't know about, a leftover from an unfinished start, a stale in-progress mark). The scheduler does this every few minutes. See §8.15. |
+| `schedule-catch-up` | Lists nodes that aren't in the state their schedule wants (after an outage longer than the scheduler's one-hour catch-up window); `--apply` starts/stops them after you confirm. See §8.15. |
+| `migrate-abandon` | Cancels an unfinished migration: the original instance boots from its own disk again and the copy's volume is deleted. See §6.4. |
+| `alerts-check` / `alerts-test` | Show what needs attention right now (exit 1 if anything) / send a test alert. Alerts go to a webhook and/or email. See §8.15. |
 | `reset-host-key` | Admin escape hatch — re-establishes SSH trust for a node after a genuine, confirmed key change. You should rarely need this either; see [§8](#8-day-to-day-usage) and the one-time migration note below. |
 | `rebuild` | Disaster recovery — reconstructs your local registry from tags on your own Linode account, in case the machine running this tool (and its local records) is ever lost. You should rarely need this either. |
 | `backup` | On-demand, whole-system backup — re-syncs every node's and group's Object Storage record, takes a full local/remote database snapshot, and saves the trusted host keys. Meant to be run on a schedule (cron/systemd timer). See §8.10. |
@@ -298,7 +302,7 @@ Every command below is run from the repository root, with the virtual environmen
 | `holiday-settings` | Whether account-wide holidays apply to a group or a node (a node's own setting overrides its group's). See §8.14. |
 | `backup-config` | Shows where this tool backs itself up and how the last backup went; sets, tests or removes the Object Storage settings. See §8.10. |
 | `restore` | On a replacement host: puts the newest (or a chosen, or a local) database snapshot in place, plus the trusted host keys. Run `rebuild` afterward. See §8.10. |
-| `ssh-key-backup` / `ssh-key-restore` | Store the deployment SSH key in Object Storage, encrypted with a passphrase you keep, and get it back on a replacement host. See §8.10. |
+| `ssh-key-protect` / `ssh-key-restore` | The deployment SSH key is kept recoverable automatically (encrypted in the database and Object Storage, public half in your Linode profile, passphrase in your Linode account); `ssh-key-protect` checks it now, `ssh-key-restore` gets it back on a replacement host. See §8.10. (`ssh-key-backup` stores an extra copy under a passphrase you choose.) |
 | `offboard` | Permanently decommission a stopped node — releases its reserved IP, removes it from tracking, and optionally deletes its volumes. For when you're actually done with a node, not just pausing it. |
 | `set-vpc-address` | Gives a stopped node's VPC interface a different address, used from its next start — for when another instance took its address while it was stopped. |
 | `deregister` | Admin escape hatch — removes a node from local tracking only, with no changes to the real Linode instance, volumes, or reserved IP at all. For correcting a wrong or unsafe local record, not for decommissioning a real node (use `offboard` for that). |
@@ -433,6 +437,21 @@ checkpoint confirms the manual `dd` + `sync` step (§6.2) is actually done — b
 boot config any earlier could boot into an empty or half-copied volume. If you see this and
 you're certain `dd` + `sync` genuinely finished, or you want to abandon this attempt entirely,
 re-run `migrate-start` with `--force` (below) rather than forcing `migrate-resume` past the check.
+
+**Cancelling a migration.** Changed your mind, or the host running this tool was lost while a
+migration waited for its copy step? Cancel it — the original instance is taken out of Rescue Mode
+and boots from its own disk, which a migration never changes before `migrate-resume`, and the
+destination volume (the copy) is deleted:
+
+```
+python instance_manager.py migrate-abandon --name redis-standby-1
+```
+
+It asks you to type the name (`--yes` skips that; `--no-boot` leaves the original powered off). A
+kept pre-migration backup stays until you remove it (`backup-delete`). Once `migrate-resume` has
+started changing the boot config, cancelling is refused — finish with `migrate-resume`, or
+`rollback` if a backup was kept. The migration page in the dashboard has **Cancel this migration**
+for the same thing.
 
 **`migrate-resume` itself crashes or times out partway through.** It's safe to just run it again
 — it checkpoints its own progress (creating the boot config, shutting down, booting, verifying
@@ -898,7 +917,8 @@ prompt (e.g. in a script), but only once you're scripting around a case you've a
 safe. (If another `start`/`stop`/`rebuild`
 process for this same node is genuinely still running right now, `clear-lock` refuses outright
 with a clear error instead of racing it — this only ever matters for a lock left behind by
-something that actually crashed.)
+something that actually crashed.) The scheduler also clears such a mark by itself within a few
+minutes, and the instance's dashboard page shows a **Clear lock** button while it's set.
 
 ### `reset-host-key` — admin escape hatch for a genuine SSH key change
 
@@ -1568,21 +1588,44 @@ own `state/known_hosts`), to Object Storage and next to the local snapshot.
 
 **If you install with `install.sh`** (see `DEPLOYMENT.md`), an hourly backup timer is set up for you.
 
+**Backup on every change.** With Object Storage configured, the scheduler also uploads a fresh
+database snapshot within about a minute of any change (`full-backups/instances-continuous.db`,
+overwritten each time), so a lost host loses at most about a minute of changes. Old timestamped
+snapshots are pruned after each hourly backup: everything from the last 48 hours, then one a day
+for 30 days (`LIS_BACKUP_KEEP_ALL_HOURS`, `LIS_BACKUP_KEEP_DAILY_DAYS`). The newest snapshot and the
+continuous one are never deleted.
+
+**The deployment SSH key.** Every managed node trusts exactly one key, the deployment's own, so it's
+kept recoverable automatically: encrypted in the database (and therefore every snapshot) and in
+Object Storage, with `LIS_SSH_KEY_PASSPHRASE` from `.env` (generated at install, shown once); its
+public half under your Linode profile's SSH keys; and the passphrase in a private StackScript in
+your Linode account (`lis-recovery-…` — don't run or delete it). A replacement host fetches the
+passphrase with the API token it needs anyway, so nothing extra has to be remembered. Anyone with a
+full-access Linode token could already get root on every instance (rescue mode, root password
+reset, Lish), and the passphrase opens nothing without the encrypted key, which needs your Object
+Storage keys or a snapshot. Check it any time:
+
+```
+python instance_manager.py ssh-key-protect
+```
+
 **Moving to a new host.** If the machine running this tool is lost, `sudo ./install.sh recover` on a
 fresh one restores everything before starting anything — see `DEPLOYMENT.md` §8.1. The pieces it
 uses are also available directly:
 
 ```
-python instance_manager.py ssh-key-backup     # once, on the original host: the deployment SSH key, encrypted
-python instance_manager.py ssh-key-restore    # on the new host (asks for the passphrase)
+python instance_manager.py ssh-key-restore --save-passphrase   # the deployment SSH key (passphrase from your Linode account)
 python instance_manager.py restore --list     # the snapshots in your bucket
 python instance_manager.py restore            # newest snapshot + trusted host keys (or --snapshot / --from-file)
 python instance_manager.py rebuild            # adds anything newer than the snapshot, from tags and Object Storage
+python instance_manager.py heal               # adopts instances the snapshot doesn't know about (§8.15)
+python instance_manager.py schedule-catch-up  # nodes left off their schedule by the outage (§8.15)
 ```
 
 `restore` refuses to overwrite a database that already has instances or groups unless you pass
 `--force`, which moves it aside rather than deleting it. A snapshot from an older version is
-upgraded automatically.
+upgraded automatically. `rebuild` also finds a node whose tags were removed, through its Object
+Storage record.
 
 ### 8.11 High availability — why this isn't an always-on active-active or active-passive setup
 
@@ -1936,6 +1979,53 @@ tomorrow**); each node's page has an **Account-wide holidays** choice. A node wh
 holiday says so on its page. Holidays and these settings are included in backups and come back
 with `restore`/`rebuild` (the settings are also kept in tags on each node's OS volume and in the
 group's Object Storage record).
+
+### 8.15 Recovering safely: self-healing, missed schedules and alerts
+
+**Self-healing (`heal`).** The scheduler compares every node with your account every few minutes
+and fixes its own records where the account proves them wrong — for example after a database was
+restored from a snapshot taken before a node was started:
+
+- the node's OS volume is attached to an instance its record doesn't point at → that instance is
+  the node; it's recorded (never a second one created, and a `stop` stops that one);
+- the record points at an instance that's gone and nothing holds the OS volume → stopped;
+- an instance with the node's label, no disks and none of your volumes, at least 15 minutes old →
+  left behind by a start that never finished; it's deleted (nothing that can hold data ever is);
+- a node marked "in progress" while no start/stop is running for it → cleared.
+
+`start`/`stop` make the same check for the node they act on. Run it yourself any time:
+
+```
+python instance_manager.py heal                 # every node; --name to limit
+```
+
+Volumes and reserved IPs are never deleted by this.
+
+**Missed schedules (`schedule-catch-up`).** The scheduler acts on a start or stop for an hour after
+it was due. After a longer outage (for example while the scheduler host was being replaced), nodes
+are left as they were until their next scheduled time. These are listed — on the dashboard's
+Instances page and here — but nothing is started or stopped until you approve it:
+
+```
+python instance_manager.py schedule-catch-up                     # list
+python instance_manager.py schedule-catch-up --apply             # act on them, after confirming
+python instance_manager.py schedule-catch-up --apply --include-changed-by-hand --yes
+```
+
+A node someone started or stopped by hand after the scheduled time is marked as such and left
+alone unless you include it. Stops run before starts, following each group's start order.
+
+**Alerts.** Set a webhook (`LIS_ALERT_WEBHOOK_URL` — Slack and Teams incoming webhooks work as is)
+and/or email (`LIS_ALERT_EMAIL_TO` plus the `LIS_ALERT_SMTP_*` settings; see `DEPLOYMENT.md`
+§8.2) to hear about: the scheduler not checking in for 10 minutes, backups failing, the deployment
+SSH key not stored in every place, or nodes staying off their schedule. Each is sent when it
+starts, every 6 hours while it lasts, and once when resolved. Linode blocks outbound SMTP ports on
+new accounts until support opens them.
+
+```
+python instance_manager.py alerts-test        # send a test alert
+python instance_manager.py alerts-check       # what needs attention now (exit 1 if anything)
+```
 
 ## 9. Costs
 

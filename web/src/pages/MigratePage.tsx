@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, ApiError, errorWarnings } from '../api/client'
-import type { AssistedCopyReadiness, BackupEstimate, MigrateResumeResult } from '../api/types'
+import type {
+  AssistedCopyReadiness,
+  BackupEstimate,
+  MigrateAbandonResult,
+  MigrateResumeResult,
+} from '../api/types'
 import {
   Button,
   Card,
@@ -36,6 +41,7 @@ type Step =
   | 'stale_checkpoint'
   | 'live'
   | 'reconciled'
+  | 'cancelled'
 type ManualPhase = 'lsblk' | 'confirm_devices' | 'run_dd'
 export function MigratePage() {
   const [searchParams] = useSearchParams()
@@ -85,10 +91,15 @@ export function MigratePage() {
   const [onboardErrorWarnings, setOnboardErrorWarnings] = useState<string[] | null>(null)
   const ssh = useSshCredentials(instanceId ?? undefined)
   const currentKeyRef = useRef<string | null>(migrationKey)
+  const [confirmCancel, setConfirmCancel] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelResult, setCancelResult] = useState<MigrateAbandonResult | null>(null)
   useEffect(() => {
     currentKeyRef.current = migrationKey
     setAssisted(null)
     setAssistedCopyDone(false)
+    setConfirmCancel(false)
+    setCancelResult(null)
     return () => {
       currentKeyRef.current = null
     }
@@ -247,6 +258,54 @@ export function MigratePage() {
       if (requestedKey === currentKeyRef.current) setProgress(null)
     }
   }
+  const cancelMigration = async () => {
+    const requestedKey = migrationKey
+    setCancelling(true)
+    setError(null)
+    try {
+      const result = await statusBar.run(`Cancelling the migration of "${name}"`, (report) =>
+        api.abandonMigration(name, true, report, (warnings) => {
+          if (requestedKey === currentKeyRef.current) setMigrateWarnings(warnings)
+        }),
+      )
+      if (requestedKey !== currentKeyRef.current) return
+      setCancelResult(result)
+      setStep('cancelled')
+    } catch (e) {
+      if (requestedKey !== currentKeyRef.current) return
+      setError(e instanceof ApiError ? e.message : 'Could not cancel the migration.')
+    } finally {
+      if (requestedKey === currentKeyRef.current) {
+        setCancelling(false)
+        setConfirmCancel(false)
+      }
+    }
+  }
+  const cancelPanel = (
+    <div className="space-y-2 border-t border-slate-200 pt-4">
+      {confirmCancel ? (
+        <>
+          <p className="text-sm text-slate-700">
+            Cancel this migration? The original instance leaves Rescue Mode and boots from its own disk,
+            unchanged. The destination volume (the copy) is deleted. A pre-migration backup, if one was kept,
+            stays until you remove it on the Backups page.
+          </p>
+          <div className="flex gap-2">
+            <Button variant="danger" disabled={cancelling} onClick={() => void cancelMigration()}>
+              {cancelling ? 'Cancelling…' : 'Yes, cancel the migration'}
+            </Button>
+            <Button disabled={cancelling} onClick={() => setConfirmCancel(false)}>
+              Keep it
+            </Button>
+          </div>
+        </>
+      ) : (
+        <Button className="w-full" onClick={() => setConfirmCancel(true)}>
+          Cancel this migration
+        </Button>
+      )}
+    </div>
+  )
   const checkAssistedCopy = async () => {
     const requestedKey = migrationKey
     setAssistedChecking(true)
@@ -906,6 +965,8 @@ export function MigratePage() {
               </>
             )}
 
+            {step === 'manual' && !assistedRunning && cancelPanel}
+
             {step === 'incomplete' && (
               <>
                 <div className="rounded-md bg-emerald-50 px-3 py-3 text-sm text-emerald-800 ring-1 ring-inset ring-emerald-200">
@@ -948,6 +1009,7 @@ export function MigratePage() {
                 <Button variant="secondary" className="w-full" onClick={() => navigate('/onboard')}>
                   Back to Onboard
                 </Button>
+                {cancelPanel}
               </>
             )}
 
@@ -974,6 +1036,35 @@ export function MigratePage() {
                 >
                   Start a new migration for this instance
                 </Button>
+                <Button variant="secondary" className="w-full" onClick={() => navigate('/onboard')}>
+                  Back to Onboard
+                </Button>
+                {cancelPanel}
+              </>
+            )}
+
+            {step === 'cancelled' && cancelResult && (
+              <>
+                <div className="rounded-md bg-emerald-50 px-3 py-3 text-sm text-emerald-800 ring-1 ring-inset ring-emerald-200">
+                  Migration cancelled.{' '}
+                  {cancelResult.instance_state === 'booted'
+                    ? `Instance ${cancelResult.instance_id} is running from its original disk again.`
+                    : cancelResult.instance_state === 'gone'
+                      ? `Instance ${cancelResult.instance_id} no longer exists.`
+                      : `Instance ${cancelResult.instance_id}: ${cancelResult.instance_state.replace('_', ' ')}.`}{' '}
+                  {cancelResult.volume_state === 'deleted'
+                    ? `The copy's volume ${cancelResult.volume_id} was deleted.`
+                    : cancelResult.volume_state === 'kept'
+                      ? `Volume ${cancelResult.volume_id} was kept (it belongs to something else).`
+                      : ''}
+                </div>
+                {cancelResult.notes.length > 0 && <WarningBanner messages={cancelResult.notes} />}
+                {cancelResult.backup_kept && (
+                  <p className="text-sm text-slate-700">
+                    The pre-migration backup is still kept; remove it on the Backups page when you no longer
+                    need it.
+                  </p>
+                )}
                 <Button variant="secondary" className="w-full" onClick={() => navigate('/onboard')}>
                   Back to Onboard
                 </Button>

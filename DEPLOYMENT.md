@@ -30,20 +30,20 @@ script did.
 ```
 git clone https://github.com/sandipgangdhar/linode-instance-scheduler.git
 cd linode-instance-scheduler
-sudo ./install.sh install --backup-ssh-key --domain scheduler.example.com
+sudo ./install.sh install --domain scheduler.example.com
 ```
 
 It asks for your Linode API token, your Object Storage bucket (strongly recommended — it's what
-makes moving to a new host lossless), optionally a "Login with Linode" OAuth app, and a passphrase
-for the encrypted copy of the SSH key. With `--domain` (or when you answer the domain question),
+makes moving to a new host lossless) and optionally a "Login with Linode" OAuth app. It generates
+the deployment SSH key and a passphrase that encrypts its stored copies, and shows the passphrase
+once at the end (see §8). With `--domain` (or when you answer the domain question),
 it also installs Caddy and serves the dashboard at `https://<domain>`, with a certificate Caddy
 obtains and renews on its own — the domain's A record must already point at this host's public
 IP, and ports 80 and 443 must be open (Cloud Firewall and any host firewall; the script opens ufw
 itself). Use the same domain in the OAuth app's callback URL: `https://<domain>/oauth/callback`.
 It installs to `/opt/linode-instance-scheduler` and prints
 the deployment's SSH public key at the end — add that key to every instance you'll manage. For a
-non-interactive run, put the settings in a file and pass `--env-file <file> --passphrase-file
-<file> --yes`. Nothing is saved until every question is answered, so an interrupted
+non-interactive run, put the settings in a file and pass `--env-file <file> --yes`. Nothing is saved until every question is answered, so an interrupted
 run (Ctrl+C, a dropped SSH session) leaves no half-written configuration; re-running asks again
 for anything still missing, such as Object Storage or the "Login with Linode" settings. Run `sudo ./install.sh --help` for every option.
 
@@ -164,8 +164,9 @@ Fill in:
 
 - **`LINODE_API_TOKEN`** — a Personal Access Token scoped to **Linodes** (Read/Write), **Volumes**
   (Read/Write), and **IPs** (Read/Write); add **VPCs** (Read) too if any managed instance uses a
-  VPC interface. **Account** (Read Only) is enough to satisfy the tool's own startup check. Create
-  one at Cloud Manager → Profile → API Tokens. This is the one credential every part of the tool
+  VPC interface, and **StackScripts** (Read/Write) for the passphrase's recovery copy (§8).
+  **Account** (Read Only) is enough to satisfy the tool's own startup check. Create one at Cloud
+  Manager → Profile → API Tokens. This is the one credential every part of the tool
   uses to actually talk to Linode — the CLI, the poller, and the API server alike.
 - **`LINODE_OAUTH_CLIENT_ID`/`LINODE_OAUTH_CLIENT_SECRET`/`LINODE_OAUTH_REDIRECT_URI`** — only
   needed if you're running the REST API/dashboard with "Login with Linode" (§6). Leave blank if
@@ -174,6 +175,10 @@ Fill in:
   isn't at the tool's default path (`~/.ssh/linode_spike_key`). The CLI's own `--ssh-key` flag and
   this variable both point at the same default, so if you generated your key at the default path
   you don't need to set this at all.
+- **`LIS_SSH_KEY_PASSPHRASE`** — encrypts the stored copies of the deployment SSH key (§8). At
+  least 12 characters; `install.sh` generates one.
+- **`LIS_ALERT_WEBHOOK_URL`, `LIS_ALERT_EMAIL_TO` and the `LIS_ALERT_SMTP_*` settings** —
+  optional alerts (§8.2).
 - **`API_ALLOWED_ORIGINS`** — only needed if a browser-based client (the dashboard, or your own
   frontend) will call the REST API from a *different* origin than the one serving it. Leave unset
   to disable CORS entirely — correct for the common case where the dashboard is served by the same
@@ -363,7 +368,7 @@ Three things live only on the deployment host, and a replacement host needs all 
 |---|---|---|
 | The database (instances, schedules, groups, hooks, start order, API tokens, history) | `state/instances.db` | `backup`: a full snapshot to Object Storage and/or a local directory. Also, independently: Linode tags on every managed resource plus per-instance, per-group and per-API-token records in Object Storage, which `rebuild` and `restore` read (a token revoked after a snapshot stays revoked) |
 | The trusted SSH host keys of your instances | `state/known_hosts` | `backup` saves a copy to Object Storage and next to each local snapshot |
-| The deployment SSH private key | `keys/deploy_key` (or `LINODE_SSH_KEY_PATH`) | Your own copy, and/or `ssh-key-backup`: an encrypted copy in Object Storage that only your passphrase opens |
+| The deployment SSH private key | `keys/deploy_key` (or `LINODE_SSH_KEY_PATH`) | Kept automatically, encrypted, in the database (so in every snapshot) and in Object Storage; its public half in your Linode profile's SSH keys; the passphrase's recovery copy in a private StackScript in your account |
 
 **Routine backups.** `install.sh` installs a timer that runs `backup --backup-dir
 /opt/linode-instance-scheduler/backups` every hour and keeps two weeks of local snapshots. By hand,
@@ -378,18 +383,33 @@ configured it also re-uploads every instance and group record, a full database s
 trusted host keys. Local snapshots alone are lost with the host — copy them elsewhere, or use Object
 Storage.
 
+**Backup on every change.** With Object Storage configured, the scheduler also uploads a fresh
+database snapshot within about a minute of any change — a start or stop, a schedule, group, hook,
+holiday or token change, the activity log — to one object, `full-backups/instances-continuous.db`,
+overwritten each time. Losing the host then loses at most about a minute of changes, not up to an
+hour. The hourly snapshots stay as a history to go back to.
+
+**Old snapshots** are pruned after each hourly backup: every snapshot from the last 48 hours is
+kept, then the newest one of each day for 30 days, then none
+(`LIS_BACKUP_KEEP_ALL_HOURS`/`LIS_BACKUP_KEEP_DAILY_DAYS`). The newest snapshot and the continuous
+one are never deleted.
+
 **The SSH key.** Every managed instance trusts exactly one key, the deployment's own. A replacement
-host can't manage anything without it, and a new key would have to be added to every instance by
-hand. Store it encrypted in your bucket once:
+host can't manage anything without it, so it's kept recoverable automatically (`install.sh`, every
+backup, and the scheduler every hour do this; `ssh-key-protect` does it on demand):
 
-```
-python instance_manager.py ssh-key-backup        # asks for a passphrase (12+ characters)
-```
+- encrypted (AES-256-GCM, key derived by scrypt from `LIS_SSH_KEY_PASSPHRASE`) in the database, so
+  every snapshot carries it, and in Object Storage;
+- its public half under your Linode profile's SSH keys;
+- the passphrase itself in a private StackScript in your Linode account (`lis-recovery-…`, visible
+  only to your account's users with StackScripts access; don't run or delete it).
 
-The key is encrypted on this host (AES-256-GCM, with a key derived from your passphrase by scrypt)
-before it's uploaded; the passphrase is never stored anywhere. Keep it in your password manager —
-without it, the stored copy can't be opened. `install.sh install --backup-ssh-key` does this for
-you.
+A replacement host fetches the passphrase with the API token it needs anyway, so recovery needs
+nothing extra from you. This adds no new way in: anyone holding a full-access Linode token can
+already get root on every instance (rescue mode, root password reset, Lish), and the passphrase
+opens nothing without the encrypted key, which needs your Object Storage keys or a database
+snapshot. Keeping your own copy of the passphrase (shown once at install) is still a good idea.
+The System backup page and `alerts-check` show whether every copy is in place.
 
 ### 8.1 Moving to a new host (the old one is lost)
 
@@ -398,19 +418,28 @@ On a fresh host, with the old one shut down or gone:
 ```
 git clone https://github.com/sandipgangdhar/linode-instance-scheduler.git
 cd linode-instance-scheduler
-sudo ./install.sh recover --ssh-key-from-backup
+sudo ./install.sh recover
 ```
 
-Give it the same API token and the **same bucket** the old host used, and the SSH key passphrase.
-It then, before starting anything:
+Give it the same API token and the **same bucket** the old host used. Leave the passphrase question
+blank: it's fetched from your Linode account. It then, before starting anything:
 
 1. installs everything exactly as `install` does, but leaves the services stopped;
-2. fetches and decrypts the SSH key (or takes the original key file with `--ssh-key <path>`);
-3. restores the newest database snapshot from the bucket (`--snapshot <key>` for an older one,
-   `--from-file <path>` for a local snapshot) and the trusted host keys;
+2. fetches and decrypts the SSH key from the bucket, or from the restored database (or takes the
+   original key file with `--ssh-key <path>`);
+3. restores the newest database snapshot from the bucket — usually the continuous one, a minute or
+   so old (`--snapshot <key>` for an older one, `--from-file <path>` for a local snapshot) — and
+   the trusted host keys;
 4. runs `rebuild`, which reads Linode's tags and the bucket's instance and group records to add
-   anything onboarded or changed after that snapshot, without touching what the snapshot restored;
-5. starts the services and takes a fresh backup.
+   anything onboarded or changed after that snapshot, without touching what the snapshot restored —
+   including a node whose tags were removed, found through its Object Storage record;
+5. runs `heal`, which compares every node with the account: a node the snapshot thinks is stopped
+   but whose OS volume is attached to a running instance is recorded as that instance (never a
+   second one created); a leftover blank instance from a start that never finished is deleted; a
+   stale "in progress" mark is cleared;
+6. starts the services and takes a fresh backup;
+7. lists nodes that aren't in the state their schedule wants (if the outage lasted longer than the
+   scheduler's one-hour catch-up window) and asks whether to start/stop them now.
 
 Add `--no-start` to stop after step 4 and review `instance_manager.py list` first; then run
 `sudo ./install.sh start`.
@@ -426,23 +455,50 @@ not re-armed.
 
 - An instance shown as `needs_manual_recovery`: boot it once from Cloud Manager, then
   `onboard --name <name> --instance-id <id> --force`.
+- Nodes left off their schedule: the dashboard's Instances page lists them for review, or run
+  `schedule-catch-up` (add `--apply` to act on them after confirming).
+- An unfinished migration: resume it, or cancel it (`migrate-abandon`, or "Cancel this migration"
+  in the dashboard) — the original instance boots from its own disk again.
 - An instance that refuses to start with a host-key warning was onboarded after the last backup
   of the host keys — confirm it's really your instance, then `reset-host-key --name <name>`.
 - If the new host has a different address or name: point DNS and your reverse proxy at it, and
   update the OAuth app's redirect URI and `LINODE_OAUTH_REDIRECT_URI` in `.env`.
 
 Never run the old and new hosts' pollers at the same time — two pollers acting on the same
-instances can race each other. `recover` asks you to confirm the old host is stopped.
+instances can race each other. `recover` asks you to confirm the old host is stopped. The SSL
+certificate needs nothing: Caddy on the new host obtains a new one as soon as the domain points
+at it.
 
 **Without `install.sh`**, the same steps by hand: install as in §3–§6 with the original SSH key in
 place and the services stopped, then:
 
 ```
-python instance_manager.py ssh-key-restore      # if you stored it with ssh-key-backup
+python instance_manager.py ssh-key-restore --save-passphrase   # passphrase from your Linode account
 python instance_manager.py restore              # newest snapshot + host keys (--list, --snapshot, --from-file)
+python instance_manager.py ssh-key-restore --from-db --force --save-passphrase   # if the bucket had no key copy
 python instance_manager.py rebuild
+python instance_manager.py heal
+python instance_manager.py schedule-catch-up   # review; --apply to act
 sudo systemctl start linode-scheduler-poll linode-scheduler-api
 ```
+
+### 8.2 Alerts
+
+Set either or both channels in `.env` and restart the services:
+
+- **Webhook** — `LIS_ALERT_WEBHOOK_URL`. Receives a JSON POST `{"text", "event", "details",
+  "host"}`; Slack and Microsoft Teams incoming webhooks accept it as is.
+- **Email** — `LIS_ALERT_EMAIL_TO` (comma-separated), `LIS_ALERT_SMTP_HOST`,
+  `LIS_ALERT_SMTP_PORT` (587), `LIS_ALERT_SMTP_SECURITY` (`starttls`, `ssl` or `none`),
+  `LIS_ALERT_SMTP_USER`, `LIS_ALERT_SMTP_PASSWORD`, `LIS_ALERT_EMAIL_FROM`. Linode blocks
+  outbound SMTP ports on new accounts until you ask support to open them; a mail provider that
+  accepts another port works too.
+
+An alert is sent when one of these starts, again every 6 hours while it lasts, and once when it
+clears: the scheduler hasn't checked in for 10 minutes (noticed by the API service), backups are
+failing, the deployment SSH key isn't stored in every place, or nodes stay off their schedule.
+`alerts-test` sends a test message; `alerts-check` lists what would be alerted right now and exits
+1 if anything — handy for your own monitoring. The System backup page shows the same.
 
 ---
 

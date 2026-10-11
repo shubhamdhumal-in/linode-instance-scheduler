@@ -419,6 +419,70 @@ export interface SystemBackupStatus {
     local_path: string | null
     problems: string[]
   } | null
+  continuous?: {
+    enabled: boolean
+    pending_changes: number
+    last_backup_at: string | null
+    last_attempt_at: string | null
+    last_key: string | null
+    last_error: string | null
+    min_interval_seconds: number
+  } | null
+  ssh_key?: {
+    passphrase_set: boolean
+    stored_in_database: boolean
+    fingerprint: string | null
+    in_object_storage: boolean
+    linode_ssh_key_id: number | null
+    updated_at: string | null
+    passphrase_escrowed?: boolean
+  } | null
+}
+export interface HealthStatus {
+  problems: {
+    key: string
+    message: string
+  }[]
+  alerts: {
+    webhook: boolean
+    email: boolean
+    email_to: string[]
+  }
+}
+export interface KeyProtectionResult {
+  fingerprint: string | null
+  stored_in_database: boolean
+  object_storage: string
+  linode_ssh_key_id: number | null
+  problems: string[]
+  ok: boolean
+}
+export interface ScheduleMismatch {
+  name: string
+  current: 'running' | 'stopped'
+  desired: 'running' | 'stopped'
+  via_group: string | null
+  missed_at: string | null
+  changed_by_hand: boolean
+  reason: string
+}
+export interface CatchUpResult {
+  items: {
+    name: string
+    action: string
+    outcome: string
+    ok: boolean
+    detail: string | null
+  }[]
+}
+export interface MigrateAbandonResult {
+  instance_id: number | null
+  instance_state: string
+  volume_id: number | null
+  volume_state: string
+  previous_attempts_archived: number
+  backup_kept: boolean
+  notes: string[]
 }
 export interface GroupExtendResult {
   group: string

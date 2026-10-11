@@ -24,6 +24,7 @@ export default defineConfig({
       '/backups': 'http://127.0.0.1:8000',
       '/holidays': 'http://127.0.0.1:8000',
       '/system': 'http://127.0.0.1:8000',
+      '/schedule': 'http://127.0.0.1:8000',
     },
   },
 })
