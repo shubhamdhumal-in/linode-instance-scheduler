@@ -502,7 +502,12 @@ sudo systemctl start linode-scheduler-poll linode-scheduler-api
 
 ### 8.2 Alerts
 
-Set either or both channels in `.env` and restart the services:
+Set either or both channels on the dashboard's **System backup** page (Alerts form, then **Send
+test alert**), with `alerts-config` (`--email-to`, `--smtp-host`, `--smtp-port`, `--smtp-user`,
+`--smtp-password` to be prompted, `--webhook-url`), or in `.env`. Running services pick changes up
+without a restart. Use the SMTP server of a mail account you already have (Google Workspace:
+`smtp.gmail.com`:587 with an app password; Microsoft 365: `smtp.office365.com`:587) or a sending
+service (SendGrid, Mailgun, Amazon SES, Brevo; port 2525 avoids Linode's SMTP block). The settings:
 
 - **Webhook** — `LIS_ALERT_WEBHOOK_URL`. Receives a JSON POST `{"text", "event", "details",
   "host"}`; Slack and Microsoft Teams incoming webhooks accept it as is.
@@ -514,7 +519,43 @@ Set either or both channels in `.env` and restart the services:
 
 An alert is sent when one of these starts, again every 6 hours while it lasts, and once when it
 clears: the scheduler hasn't checked in for 10 minutes (noticed by the API service), backups are
-failing, the deployment SSH key isn't stored in every place, or nodes stay off their schedule.
+failing or the daily restore test fails, the deployment SSH key isn't stored in every place, nodes
+stay off their schedule, the Linode API token is rejected or expires within 14 days, the disk
+holding the database is nearly full, Shutdown Watchdog is off on this host, or this host is
+standing by because another scheduler holds the lease (§8.3).
+
+**When the whole host is gone** nothing on it can send an alert. Two things cover that:
+`install.sh` turns on Linode's **Shutdown Watchdog** for this host, so a crash or unexpected
+power-off is followed by Linode booting it again (and systemd restarting the services); and
+`LIS_HEARTBEAT_URL` (`--heartbeat-url`) takes a ping URL from an uptime monitor such as
+Healthchecks.io, Better Stack or Uptime Kuma. The scheduler pings it every minute, and the monitor
+tells you when the pings stop. Linode's own resource-usage email alerts can't do this: they fire
+only when CPU, disk or network usage goes *above* a threshold, and a dead host has no usage.
+`host-watchdog` shows the watchdog, `--enable` turns it on.
+
+### 8.3 One active scheduler at a time
+
+With Object Storage configured, the active scheduler holds a lease object in the bucket and renews
+it every 30 seconds; a lease not renewed for 3 minutes has expired. A scheduler that finds a fresh
+lease it doesn't hold **stands by**: it doesn't start, stop or heal anything and doesn't upload
+backups, and it raises a `lease` alert. That makes it safe if an old host comes back after a new
+one took over. `recover` takes the lease over straight away (you confirmed the old host is gone);
+otherwise a replacement takes it once the old lease expires, and a cleanly stopped scheduler gives
+it up at once. `scheduler-lease` shows who holds it; `scheduler-lease --take-over` (or the System
+backup page) makes this host the active one. Without Object Storage there's no shared place for a
+lease, so make sure only one scheduler runs.
+
+### 8.4 Restore testing and upgrades
+
+Every day the scheduler restore-tests the backups without touching the live database: it downloads
+the newest snapshot, checks its checksum and SQLite's integrity check, that it isn't more than a day
+old, that the continuous copy holds every node, and that the stored copies of the SSH key decrypt
+to the real key. A failure is alerted. `backup-verify` runs it on demand. No snapshot that fails
+the integrity check is ever uploaded, so a damaged database can't replace a good copy.
+
+Re-running `install.sh install` to upgrade first takes a snapshot with the old code into
+`backups/pre-upgrade-<time>/`; the end of the run says how to go back to the previous version with
+it.
 `alerts-test` sends a test message; `alerts-check` lists what would be alerted right now and exits
 1 if anything — handy for your own monitoring. The System backup page shows the same.
 

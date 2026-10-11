@@ -104,7 +104,8 @@ async def lifespan(app: FastAPI):
             return
         while True:
             with contextlib.suppress(Exception):
-                im.evaluate_alerts(include_scheduler=True)
+                im.reload_object_storage_settings_if_changed()
+                im.evaluate_alerts(include_scheduler=True, client=app.state.linode_client)
             if stop_alerts.wait(ALERT_CHECK_INTERVAL_S):
                 return
 
@@ -268,6 +269,18 @@ _ROUTE_SCOPES: dict[tuple[str, str], str | None] = {
     ("GET", "/schedule/missed"): "schedules:read",
     ("POST", "/schedule/missed/apply"): "schedules:catch-up",
     ("GET", "/system/health"): "activity:read",
+    ("GET", "/system/backup"): "system:read",
+    ("GET", "/system/alerts"): "system:read",
+    ("GET", "/system/host-watchdog"): "system:read",
+    ("POST", "/system/backup/run"): "system:backup",
+    ("POST", "/system/backup/verify"): "system:backup",
+    ("POST", "/system/env-backup/run"): "system:backup",
+    ("POST", "/system/ssh-key/protect"): "system:backup",
+    ("POST", "/system/heal"): "system:configure",
+    ("POST", "/system/lease/take-over"): "system:configure",
+    ("PUT", "/system/host-watchdog"): "system:configure",
+    ("PUT", "/system/env-backup/recipients"): "system:configure",
+    ("POST", "/system/alerts/test"): "system:configure",
     ("POST", "/instances/{name}/vpc-address"): "instances:vpc-address",
     ("POST", "/tokens"): "tokens:manage",
     ("GET", "/tokens"): "tokens:manage",
@@ -1112,6 +1125,36 @@ def api_env_backup_recipients(body: EnvBackupRecipientsRequest, user: str = Depe
             "result": dataclasses.asdict(result) if result else None}
 
 
+@app.post("/system/backup/verify")
+def api_backup_verify(user: str = Depends(require_session)) -> dict:
+
+    return dataclasses.asdict(im.verify_backups())
+
+
+@app.post("/system/lease/take-over")
+def api_lease_take_over(user: str = Depends(require_session)) -> dict:
+
+    status = im.acquire_or_renew_lease(take_over=True)
+    im.record_activity(f"scheduler lease take-over {'succeeded' if status.active else 'failed'}",
+                       level="warning", source="api", action="lease", actor=user)
+    return dataclasses.asdict(status)
+
+
+class WatchdogRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/system/host-watchdog")
+def api_host_watchdog(request: Request, user: str = Depends(require_session)) -> dict:
+    return im.set_host_watchdog(_client(request), enable=None)
+
+
+@app.put("/system/host-watchdog")
+def api_set_host_watchdog(body: WatchdogRequest, request: Request,
+                          user: str = Depends(require_session)) -> dict:
+    return im.set_host_watchdog(_client(request), enable=body.enabled)
+
+
 @app.post("/system/env-backup/run")
 def api_env_backup_run(user: str = Depends(require_session)) -> dict:
 
@@ -1135,6 +1178,32 @@ def api_health_problems(user: str = Depends(require_session)) -> dict:
     return {"problems": [dataclasses.asdict(p) for p in im.check_health()],
             "alerts": {"webhook": channels["webhook"], "email": channels["email"],
                        "email_to": channels["email_to"]}}
+
+
+class AlertSettingsRequest(BaseModel):
+    webhook_url: str | None = None
+    email_to: str | None = None
+    smtp_host: str | None = None
+    smtp_port: str | None = None
+    smtp_security: str | None = None
+    smtp_user: str | None = None
+    smtp_password: str | None = None
+    email_from: str | None = None
+
+
+@app.get("/system/alerts")
+def api_alert_settings(user: str = Depends(require_session)) -> dict:
+
+    return im.alert_settings_summary()
+
+
+@app.put("/system/alerts")
+def api_set_alert_settings(body: AlertSettingsRequest, user: str = Depends(require_session)) -> dict:
+
+    changes = {k: v for k, v in body.model_dump().items() if v is not None}
+    summary = im.configure_alerts(changes)
+    im.record_activity("alert settings changed", source="api", action="alerts-config", actor=user)
+    return summary
 
 
 @app.post("/system/alerts/test")
@@ -2187,6 +2256,7 @@ CONSOLE_COMMANDS = (
     "api-token-revoke",
     "clear-lock", "set-vpc-address", "reset-host-key", "rebuild", "backup", "heal",
     "migrate-abandon", "schedule-catch-up", "ssh-key-protect", "env-backup", "alerts-check",
+    "backup-verify", "scheduler-lease", "host-watchdog", "alerts-test",
     "backup-list", "rollback", "backup-delete", "console-session-delete", "holiday-add", "holiday-remove", "holiday-list", "holiday-settings",
 )
 CONSOLE_MAX_RUNTIME_S = 3 * 3600

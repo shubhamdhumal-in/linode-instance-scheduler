@@ -9,6 +9,7 @@ import type {
   SystemBackupStatus,
   KeyProtectionResult,
   HealthStatus,
+  AlertSettings,
   ScheduleMismatch,
   CatchUpResult,
   MigrateAbandonResult,
@@ -220,12 +221,53 @@ export const api = {
         detail: string | null
       } | null
     }>('PUT', '/system/env-backup/recipients', { recipients }),
+  verifyBackups: () =>
+    request<{
+      ok: boolean
+      snapshot_key: string | null
+      problems: string[]
+      checks: string[]
+    }>('POST', '/system/backup/verify'),
+  takeOverLease: () =>
+    request<{
+      active: boolean
+      role: string
+      detail: string | null
+    }>('POST', '/system/lease/take-over'),
+  getHostWatchdog: () =>
+    request<{
+      instance_id?: number
+      label?: string
+      watchdog_enabled?: boolean
+    }>('GET', '/system/host-watchdog'),
+  setHostWatchdog: (enabled: boolean) =>
+    request<{
+      instance_id?: number
+      label?: string
+      watchdog_enabled?: boolean
+    }>('PUT', '/system/host-watchdog', { enabled }),
   runEnvBackup: () =>
     request<{
       outcome: string
       detail: string | null
       ssh_key_included: boolean
     }>('POST', '/system/env-backup/run'),
+  getAlertSettings: () => request<AlertSettings>('GET', '/system/alerts'),
+  setAlertSettings: (
+    body: Partial<
+      Record<
+        | 'webhook_url'
+        | 'email_to'
+        | 'smtp_host'
+        | 'smtp_port'
+        | 'smtp_security'
+        | 'smtp_user'
+        | 'smtp_password'
+        | 'email_from',
+        string
+      >
+    >,
+  ) => request<AlertSettings>('PUT', '/system/alerts', body),
   testAlerts: () =>
     request<{
       results: Record<string, boolean>

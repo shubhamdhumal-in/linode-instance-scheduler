@@ -437,12 +437,35 @@ export interface SystemBackupStatus {
     updated_at: string | null
     passphrase_escrowed?: boolean
   } | null
+  verify?: {
+    checked_at: string
+    ok: boolean
+    snapshot_key: string | null
+    problems: string[]
+  } | null
+  lease?: {
+    role: string
+    holder_host: string | null
+    holder_renewed_at: string | null
+    updated_at: string
+  } | null
   env_backup?: {
     configured: boolean
     recipients: string[]
     uploaded_at: string | null
     last_error: string | null
   } | null
+}
+export interface AlertSettings {
+  webhook_set: boolean
+  webhook_host: string | null
+  email_to: string[]
+  smtp_host: string | null
+  smtp_port: string | null
+  smtp_security: string
+  smtp_user: string | null
+  smtp_password_set: boolean
+  email_from: string | null
 }
 export interface HealthStatus {
   problems: {

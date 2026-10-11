@@ -198,6 +198,38 @@ test('the system backup page shows key protection, problems and sends a test ale
       },
     }),
   )
+  let alertBody: Record<string, unknown> | null = null
+  await page.route('**/system/alerts', async (r: Route) => {
+    if (r.request().method() === 'PUT') {
+      alertBody = r.request().postDataJSON()
+      return r.fulfill({
+        json: {
+          webhook_set: true,
+          webhook_host: 'hooks.slack.com',
+          email_to: ['ops@example.com'],
+          smtp_host: 'smtp.example.com',
+          smtp_port: '587',
+          smtp_security: 'starttls',
+          smtp_user: 'u',
+          smtp_password_set: true,
+          email_from: null,
+        },
+      })
+    }
+    return r.fulfill({
+      json: {
+        webhook_set: true,
+        webhook_host: 'hooks.slack.com',
+        email_to: [],
+        smtp_host: null,
+        smtp_port: null,
+        smtp_security: 'starttls',
+        smtp_user: null,
+        smtp_password_set: false,
+        email_from: null,
+      },
+    })
+  })
   let tested = 0
   await page.route('**/system/alerts/test', async (r: Route) => {
     tested += 1
@@ -210,6 +242,22 @@ test('the system backup page shows key protection, problems and sends a test ale
   await page.getByRole('button', { name: 'Send test alert' }).click()
   await expect(page.locator('main')).toContainText('Test alert failed on: email')
   expect(tested).toBe(1)
+  await page.getByLabel('Send alerts to (comma-separated)').fill('ops@example.com')
+  await page.getByLabel('SMTP server').fill('smtp.example.com')
+  await page.getByLabel('Port').fill('587')
+  await page.getByLabel('SMTP user').fill('u')
+  await page.getByLabel('SMTP password').fill('app-password')
+  await page.getByRole('button', { name: 'Save alert settings' }).click()
+  await expect(page.locator('main')).toContainText('Alert settings saved')
+  expect(alertBody).toMatchObject({
+    email_to: 'ops@example.com',
+    smtp_host: 'smtp.example.com',
+    smtp_port: '587',
+    smtp_user: 'u',
+    smtp_password: 'app-password',
+  })
+  expect(alertBody).not.toHaveProperty('webhook_url')
+  await expect(page.getByLabel('SMTP password')).toHaveValue('')
   await expect(page.locator('main')).toContainText('Encrypted settings backup (age)')
   await page
     .getByLabel('Age public key')
@@ -219,4 +267,66 @@ test('the system backup page shows key protection, problems and sends a test ale
   expect(recipientsBody).toEqual({
     recipients: 'age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqsz5k3n7',
   })
+})
+test('a standby scheduler shows why and can take over after confirming; restore test runs', async ({
+  page,
+}) => {
+  await loginAs(page)
+  await mockInstanceList(page, {})
+  await mockGroupList(page)
+  await page.route('**/system/backup', (r: Route) =>
+    r.fulfill({
+      json: {
+        object_storage: {
+          configured: true,
+          bucket: 'b',
+          endpoint: 'https://e',
+          access_key_hint: 'AK..',
+          secret_key_set: true,
+        },
+        local_backup_dir: null,
+        last_backup: null,
+        continuous: null,
+        ssh_key: null,
+        env_backup: null,
+        verify: {
+          checked_at: '2026-10-12T00:00:00Z',
+          ok: false,
+          snapshot_key: 'k',
+          problems: ['the newest snapshot fails its integrity check: x'],
+        },
+        lease: {
+          role: 'standby',
+          holder_host: 'old-host',
+          holder_renewed_at: '2026-10-12T00:00:00Z',
+          updated_at: '2026-10-12T00:00:00Z',
+        },
+      },
+    }),
+  )
+  await page.route('**/system/health', (r: Route) =>
+    r.fulfill({ json: { problems: [], alerts: { webhook: false, email: false, email_to: [] } } }),
+  )
+  await page.route('**/system/host-watchdog', (r: Route) =>
+    r.fulfill({ json: { instance_id: 7, label: 'sched-host', watchdog_enabled: false } }),
+  )
+  let tookOver = 0
+  await page.route('**/system/lease/take-over', async (r: Route) => {
+    tookOver += 1
+    await r.fulfill({ json: { active: true, role: 'active', holder: null, detail: null } })
+  })
+  await page.route('**/system/backup/verify', (r: Route) =>
+    r.fulfill({ json: { ok: true, snapshot_key: 'k', problems: [], checks: ['a', 'b'] } }),
+  )
+  await page.goto('/ui/#/system-backup')
+  await expect(page.locator('main')).toContainText('fails its integrity check')
+  await expect(page.locator('main')).toContainText('old-host holds the lease')
+  await expect(page.locator('main')).toContainText('Shutdown Watchdog on this host (sched-host)')
+  await page.getByRole('button', { name: 'Take over as the active scheduler' }).click()
+  expect(tookOver).toBe(0)
+  await page.getByRole('button', { name: 'Yes, take over' }).click()
+  await expect(page.locator('main')).toContainText('This host is now the active scheduler')
+  await page.waitForTimeout(100)
+  await page.getByRole('button', { name: 'Test restore now' }).click()
+  await expect(page.locator('main')).toContainText('Restore test passed (2 checks)')
 })

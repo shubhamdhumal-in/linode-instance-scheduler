@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from '../api/client'
 import type { HealthStatus, SystemBackupStatus } from '../api/types'
+import { AlertSettingsForm } from '../components/AlertSettingsForm'
 import { Button, Card, CardHeader, ErrorBanner, Spinner } from '../components/ui'
 import { useStatusBar } from '../status/StatusBarContext'
 import { PageHeader } from './DashboardLayout'
@@ -18,6 +19,11 @@ export function SystemBackupPage() {
   const [form, setForm] = useState({ bucket: '', endpoint: '', access_key: '', secret_key: '' })
   const [busy, setBusy] = useState<string | null>(null)
   const [recipientsInput, setRecipientsInput] = useState('')
+  const [watchdog, setWatchdog] = useState<{
+    label?: string
+    watchdog_enabled?: boolean
+  } | null>(null)
+  const [confirmTakeOver, setConfirmTakeOver] = useState(false)
   const runningRef = useRef(false)
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const reload = useCallback(() => {
@@ -29,6 +35,7 @@ export function SystemBackupPage() {
       (e) => setError(message(e)),
     )
     api.getHealth().then(setHealth, () => setHealth(null))
+    api.getHostWatchdog().then(setWatchdog, () => setWatchdog(null))
   }, [])
   useEffect(() => {
     reload()
@@ -318,6 +325,107 @@ export function SystemBackupPage() {
 
             <Card>
               <CardHeader
+                title="Restore test and active scheduler"
+                subtitle="Every day the newest snapshot is downloaded and checked, and the stored key copies decrypted, without touching the live database. Only one scheduler acts at a time: the active one holds a lease in Object Storage; another one stands by."
+                action={
+                  <Button
+                    disabled={busy !== null}
+                    onClick={() =>
+                      act('verify', async () => {
+                        const r = await api.verifyBackups()
+                        return r.ok
+                          ? `Restore test passed (${r.checks.length} checks).`
+                          : `Restore test FAILED: ${r.problems.join('; ')}`
+                      })
+                    }
+                  >
+                    {busy === 'verify' ? 'Testing…' : 'Test restore now'}
+                  </Button>
+                }
+              />
+              <div className="space-y-2 px-5 py-4 text-sm text-slate-700">
+                <p>
+                  {status.verify ? (
+                    <>
+                      Last restore test:{' '}
+                      <span className={status.verify.ok ? 'text-emerald-700' : 'text-rose-700'}>
+                        {status.verify.ok ? 'passed' : 'FAILED'}
+                      </span>{' '}
+                      — {new Date(status.verify.checked_at).toLocaleString()}
+                    </>
+                  ) : (
+                    'No restore test yet.'
+                  )}
+                </p>
+                {status.verify &&
+                  !status.verify.ok &&
+                  status.verify.problems.map((p) => (
+                    <p key={p} className="text-rose-700">
+                      {p}
+                    </p>
+                  ))}
+                {watchdog && watchdog.label !== undefined && (
+                  <p>
+                    Shutdown Watchdog on this host ({watchdog.label}):{' '}
+                    {watchdog.watchdog_enabled ? (
+                      <span className="text-emerald-700">on</span>
+                    ) : (
+                      <>
+                        <span className="text-amber-700">off</span>{' '}
+                        <Button
+                          disabled={busy !== null}
+                          onClick={() =>
+                            act('watchdog', async () => {
+                              setWatchdog(await api.setHostWatchdog(true))
+                              return 'Shutdown Watchdog turned on.'
+                            })
+                          }
+                        >
+                          Turn on
+                        </Button>
+                      </>
+                    )}
+                  </p>
+                )}
+                {status.lease?.role === 'standby' ? (
+                  <div className="space-y-2 rounded-md bg-rose-50 px-3 py-2 text-rose-800 ring-1 ring-inset ring-rose-200">
+                    <p>
+                      This scheduler is standing by: {status.lease.holder_host} holds the lease, so nothing is
+                      started or stopped from here. Take over only if that host is gone for good.
+                    </p>
+                    {confirmTakeOver ? (
+                      <div className="flex gap-2">
+                        <Button
+                          variant="danger"
+                          disabled={busy !== null}
+                          onClick={() =>
+                            act('take-over', async () => {
+                              setConfirmTakeOver(false)
+                              const r = await api.takeOverLease()
+                              return r.active
+                                ? 'This host is now the active scheduler.'
+                                : `Not taken over: ${r.detail ?? ''}`
+                            })
+                          }
+                        >
+                          Yes, take over
+                        </Button>
+                        <Button onClick={() => setConfirmTakeOver(false)}>Cancel</Button>
+                      </div>
+                    ) : (
+                      <Button onClick={() => setConfirmTakeOver(true)}>
+                        Take over as the active scheduler
+                      </Button>
+                    )}
+                  </div>
+                ) : status.lease?.role === 'active' ? (
+                  <p>This host is the active scheduler.</p>
+                ) : null}
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
                 title="Encrypted settings backup (age)"
                 subtitle="A copy of this deployment's settings (.env: API token, bucket keys, OAuth and alert settings, the key passphrase) and its SSH key, encrypted to your own age public key and kept in Object Storage. This host can write it but never read it back; only your age identity, kept off this host, opens it. A replacement host then needs just the bucket settings and your identity."
                 action={
@@ -378,18 +486,59 @@ export function SystemBackupPage() {
                     {busy === 'env-recipients' ? 'Saving…' : 'Save'}
                   </Button>
                 </form>
-                <p className="text-xs text-slate-500">
-                  Make a keypair on your own machine with <code>age-keygen -o key.txt</code> and paste only
-                  the public key (age1…) here. Keep key.txt in your password manager; recovery uses it with
-                  <code> install.sh recover --env-from-backup</code>.
-                </p>
+                <details className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-700 ring-1 ring-inset ring-slate-200">
+                  <summary className="cursor-pointer font-semibold text-slate-800">
+                    How to create your age key (do this on your own computer, not this server)
+                  </summary>
+                  <ol className="mt-2 list-decimal space-y-2 pl-5">
+                    <li>
+                      Install age:
+                      <ul className="mt-1 list-disc pl-5">
+                        <li>
+                          macOS (Homebrew): <code>brew install age</code>
+                        </li>
+                        <li>
+                          Ubuntu / Debian: <code>sudo apt install age</code>
+                        </li>
+                        <li>
+                          Fedora / RHEL: <code>sudo dnf install age</code>
+                        </li>
+                        <li>
+                          Windows: <code>winget install --id FiloSottile.age</code> (or{' '}
+                          <code>choco install age.portable</code>)
+                        </li>
+                        <li>
+                          Anything else: download a release from{' '}
+                          <code>github.com/FiloSottile/age/releases</code>
+                        </li>
+                      </ul>
+                    </li>
+                    <li>
+                      Create the key: <code>age-keygen -o lis-age-key.txt</code>. It prints{' '}
+                      <code>Public key: age1…</code>.
+                    </li>
+                    <li>
+                      Copy only the <code>age1…</code> public key and paste it above, then Save.
+                    </li>
+                    <li>
+                      Keep <code>lis-age-key.txt</code> (it holds the secret <code>AGE-SECRET-KEY-…</code>{' '}
+                      line) in your password manager or another safe place off this server. Lose it and this
+                      copy can't be opened; nothing else breaks.
+                    </li>
+                    <li>
+                      To recover on a new server:{' '}
+                      <code>sudo ./install.sh recover --env-from-backup --age-identity lis-age-key.txt</code>,
+                      or read the copy anywhere with <code>age -d -i lis-age-key.txt env.age</code>.
+                    </li>
+                  </ol>
+                </details>
               </div>
             </Card>
 
             <Card>
               <CardHeader
                 title="Alerts"
-                subtitle="Sent when the scheduler stops, backups fail, the deployment key isn't stored in every place, or nodes stay off their schedule; again every 6 hours while it lasts, and once when it's resolved. Channels are set in .env (LIS_ALERT_WEBHOOK_URL, LIS_ALERT_EMAIL_TO and the SMTP settings)."
+                subtitle="Sent when the scheduler stops, backups or the restore test fail, the deployment key isn't stored in every place, nodes stay off their schedule, the API token is rejected or about to expire, the disk is nearly full, or another scheduler holds the lease; again every 6 hours while it lasts, and once when it's resolved."
                 action={
                   <Button
                     disabled={busy !== null || !(health?.alerts.webhook || health?.alerts.email)}
@@ -422,6 +571,14 @@ export function SystemBackupPage() {
                     ✗ {p.message}
                   </p>
                 ))}
+                <div className="border-t border-slate-200 pt-3">
+                  <AlertSettingsForm
+                    onSaved={(m) => {
+                      setNotice(m)
+                      reload()
+                    }}
+                  />
+                </div>
               </div>
             </Card>
 

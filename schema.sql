@@ -220,3 +220,19 @@ CREATE TABLE IF NOT EXISTS env_backup_status (
     last_attempt_at TEXT,
     last_error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS backup_verify_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    checked_at TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    snapshot_key TEXT,
+    problems TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_lease_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    role TEXT NOT NULL,
+    holder_host TEXT,
+    holder_renewed_at TEXT,
+    updated_at TEXT NOT NULL
+);

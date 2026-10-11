@@ -17,6 +17,7 @@ import shlex
 import sqlite3
 import sys
 import tempfile
+import shutil
 import signal
 import socket
 import threading
@@ -3259,9 +3260,12 @@ def _blank_leftovers(client, record: dict, *, attached: set[int] | None = None) 
 
 def _delete_leftover(client, name: str, inst, *, source: str,
                      on_warning: Callable[[str], None] | None) -> None:
+
+
+    inst_id, inst_label = inst.id, inst.label
     engine.retry_transient_or_already_done(
         inst.delete, lambda: engine._resource_confirmed_gone(client, inst))
-    message = (f"deleted leftover instance {inst.id} ('{inst.label}'): it had '{name}''s label but "
+    message = (f"deleted leftover instance {inst_id} ('{inst_label}'): it had '{name}''s label but "
                "no disks and none of its volumes -- an instance created for a start that never "
                "finished recording.")
     record_activity(message, level="warning", source=source, instance_name=name, action="heal")
@@ -6654,11 +6658,23 @@ def backup_full_system(
 ) -> BackupResult:
 
     result = BackupResult(object_storage_configured=osb.is_configured())
+    other = another_scheduler_active() if result.object_storage_configured else None
+    if other is not None:
 
 
-    key_result = protect_deployment_ssh_key(None, deployment_ssh_key_path())
-    result.ssh_key_problems = key_result.problems
-    env_result = backup_env_encrypted(verify_remote=True)
+        result.object_storage_configured = False
+        result.ssh_key_problems.append(
+            f"skipped Object Storage: another scheduler ({other.get('host')}) is active")
+        if on_warning is not None:
+            on_warning(f"  WARNING: another scheduler ({other.get('host')}) holds the lease -- "
+                       "not uploading this host's database; local snapshot only.")
+
+
+    key_result = (protect_deployment_ssh_key(None, deployment_ssh_key_path()) if other is None
+                  else KeyProtectionResult())
+    result.ssh_key_problems += key_result.problems
+    env_result = (backup_env_encrypted(verify_remote=True) if other is None
+                  else EnvBackupResult("not_configured"))
     if env_result.outcome == "failed":
         result.ssh_key_problems.append(f"encrypted settings backup: {env_result.detail}")
     for problem in key_result.problems:
@@ -6855,6 +6871,291 @@ def run_continuous_backup_if_due(*, now: datetime | None = None,
     return "uploaded"
 
 
+HEARTBEAT_URL_ENV = "LIS_HEARTBEAT_URL"
+HEARTBEAT_INTERVAL_SECONDS = 60
+
+LEASE_OBJECT_NAME = "scheduler-lease.json"
+LEASE_TTL_SECONDS = 180
+LEASE_RENEW_SECONDS = 30
+_LEASE_CONFIRM_DELAY_S = 3.0
+
+
+def scheduler_id() -> str:
+
+    path = REGISTRY_PATH.parent / "scheduler-id"
+    try:
+        value = path.read_text().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    value = f"{socket.gethostname()}-{secrets.token_hex(6)}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value + "\n")
+    return value
+
+
+def read_lease() -> dict | None:
+    raw = osb.download_deployment_file(LEASE_OBJECT_NAME)
+    if raw is None:
+        return None
+    try:
+        lease = json.loads(raw)
+    except ValueError:
+        return None
+    return lease if isinstance(lease, dict) else None
+
+
+def _lease_age_seconds(lease: dict, now: datetime) -> float:
+    try:
+        return (now - datetime.fromisoformat(lease["renewed_at"])).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        return float("inf")
+
+
+@dataclass
+class LeaseStatus:
+    active: bool
+    role: str
+    holder: dict | None = None
+    detail: str | None = None
+
+
+def _record_lease_state(status: LeaseStatus, now: datetime) -> None:
+    def _do():
+        conn = _connect()
+        try:
+            holder = status.holder or {}
+            conn.execute(
+                "INSERT INTO scheduler_lease_state (id, role, holder_host, holder_renewed_at, updated_at) "
+                "VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET role = excluded.role, "
+                "holder_host = excluded.holder_host, holder_renewed_at = excluded.holder_renewed_at, "
+                "updated_at = excluded.updated_at",
+                (status.role, holder.get("host"), holder.get("renewed_at"), now.isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    with contextlib_suppress(Exception):
+        _retry_db(_do)
+
+
+def acquire_or_renew_lease(*, now: datetime | None = None, take_over: bool = False,
+                           confirm_delay_s: float = _LEASE_CONFIRM_DELAY_S) -> LeaseStatus:
+
+    now = now or datetime.now(UTC)
+    if not osb.is_configured():
+        return LeaseStatus(True, "unfenced", detail="no Object Storage -- only one scheduler may run")
+    me = scheduler_id()
+    try:
+        lease = read_lease()
+    except Exception as e:
+        return LeaseStatus(True, "active", detail=f"couldn't read the lease ({e}); continuing")
+    mine = lease is not None and lease.get("id") == me
+    if lease is not None and not mine and _lease_age_seconds(lease, now) < LEASE_TTL_SECONDS and not take_over:
+        status = LeaseStatus(False, "standby", holder=lease,
+                             detail=f"{lease.get('host')} holds the scheduler lease")
+        _record_lease_state(status, now)
+        return status
+    record = {"id": me, "host": socket.gethostname(), "renewed_at": now.isoformat(),
+              "acquired_at": lease.get("acquired_at") if mine and lease else now.isoformat()}
+    if lease is not None and not mine:
+        record["took_over_from"] = lease.get("host")
+    try:
+        osb.upload_deployment_file(LEASE_OBJECT_NAME, json.dumps(record).encode())
+        if not mine and confirm_delay_s > 0:
+            time.sleep(confirm_delay_s)
+            check = read_lease()
+            if check is not None and check.get("id") != me:
+                status = LeaseStatus(False, "standby", holder=check,
+                                     detail=f"{check.get('host')} took the lease at the same moment")
+                _record_lease_state(status, now)
+                return status
+    except Exception as e:
+        return LeaseStatus(True, "active", detail=f"couldn't write the lease ({e}); continuing")
+    status = LeaseStatus(True, "active", holder=record)
+    _record_lease_state(status, now)
+    if lease is not None and not mine:
+        record_activity(
+            f"this scheduler took the lease over from {lease.get('host')}"
+            f"{' (explicit take-over)' if take_over else ' (its lease had expired)'}",
+            level="warning", source="scheduler", action="lease")
+    return status
+
+
+def release_lease() -> None:
+
+    if not osb.is_configured():
+        return
+    with contextlib_suppress(Exception):
+        lease = read_lease()
+        if lease is not None and lease.get("id") == scheduler_id():
+            lease["renewed_at"] = datetime(2000, 1, 1, tzinfo=UTC).isoformat()
+            lease["released"] = True
+            osb.upload_deployment_file(LEASE_OBJECT_NAME, json.dumps(lease).encode())
+
+
+def lease_state() -> dict | None:
+    def _do():
+        conn = _connect()
+        try:
+            return conn.execute("SELECT role, holder_host, holder_renewed_at, updated_at FROM "
+                                "scheduler_lease_state WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+
+    row = None
+    with contextlib_suppress(Exception):
+        row = _retry_db(_do)
+    if row is None:
+        return None
+    return {"role": row[0], "holder_host": row[1], "holder_renewed_at": row[2], "updated_at": row[3]}
+
+
+def another_scheduler_active(now: datetime | None = None) -> dict | None:
+
+    if not osb.is_configured():
+        return None
+    now = now or datetime.now(UTC)
+    with contextlib_suppress(Exception):
+        lease = read_lease()
+        if (lease is not None and lease.get("id") != scheduler_id()
+                and _lease_age_seconds(lease, now) < LEASE_TTL_SECONDS):
+            return lease
+    return None
+
+
+BACKUP_VERIFY_INTERVAL_SECONDS = 24 * 3600
+BACKUP_MAX_AGE_SECONDS = 26 * 3600
+
+
+@dataclass
+class BackupVerifyResult:
+    ok: bool
+    snapshot_key: str | None = None
+    problems: list[str] = field(default_factory=list)
+    checks: list[str] = field(default_factory=list)
+
+
+def verify_backups(*, now: datetime | None = None) -> BackupVerifyResult:
+
+    now = now or datetime.now(UTC)
+    result = BackupVerifyResult(ok=False)
+    if not osb.is_configured():
+        result.problems.append("Object Storage isn't configured -- nothing off-host to verify")
+        _record_backup_verify(result, now)
+        return result
+    keys = osb.list_database_snapshots()
+    if not keys:
+        result.problems.append("no database snapshot found in Object Storage")
+        _record_backup_verify(result, now)
+        return result
+    result.snapshot_key = keys[-1]
+    live_names = set(load_registry())
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "verify.db"
+        try:
+            osb.download_database_snapshot(result.snapshot_key, dest)
+        except osb.ObjectStorageError as e:
+            result.problems.append(f"the newest snapshot can't be downloaded intact: {e}")
+            _record_backup_verify(result, now)
+            return result
+        problem = osb.database_integrity_problem(dest)
+        if problem:
+            result.problems.append(f"the newest snapshot fails its integrity check: {problem}")
+        else:
+            result.checks.append("newest snapshot downloads, checksum matches, integrity check ok")
+            conn = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+            try:
+                snap_names = {r[0] for r in conn.execute("SELECT name FROM instances")}
+                secret = conn.execute("SELECT blob FROM deployment_secrets WHERE name = ?",
+                                      (_DEPLOYMENT_KEY_SECRET,)).fetchone() if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'deployment_secrets'").fetchone() else None
+            finally:
+                conn.close()
+            stamp = result.snapshot_key.rsplit("instances-", 1)[-1].removesuffix(".db")
+            if stamp.isdigit() and now.timestamp() - int(stamp) > BACKUP_MAX_AGE_SECONDS:
+                result.problems.append(f"the newest snapshot is {int((now.timestamp() - int(stamp)) // 3600)} hours old")
+            if result.snapshot_key == osb.CONTINUOUS_SNAPSHOT_KEY:
+                missing = live_names - snap_names
+                if missing and continuous_backup_state()["pending_changes"] == 0:
+                    result.problems.append(
+                        "the continuous snapshot is missing node(s): " + ", ".join(sorted(missing)))
+            result.checks.append(f"snapshot holds {len(snap_names)} node(s) (live: {len(live_names)})")
+            key_path = deployment_ssh_key_path()
+            passphrase = os.environ.get(SSH_KEY_PASSPHRASE_ENV, "")
+            if key_path.is_file() and passphrase:
+                if secret is None:
+                    result.problems.append("the snapshot holds no copy of the deployment SSH key")
+                else:
+                    try:
+                        if decrypt_ssh_key(bytes(secret[0]), passphrase) != key_path.read_bytes():
+                            result.problems.append("the snapshot's key copy isn't the current key")
+                        else:
+                            result.checks.append("the snapshot's key copy decrypts to the current key")
+                    except engine.ConfigError as e:
+                        result.problems.append(f"the snapshot's key copy doesn't decrypt: {e}")
+                blob = None
+                with contextlib_suppress(Exception):
+                    blob = osb.download_deployment_file(SSH_KEY_OBJECT_NAME)
+                if blob is None:
+                    result.problems.append("no encrypted key copy in Object Storage")
+                else:
+                    try:
+                        if decrypt_ssh_key(blob, passphrase) == key_path.read_bytes():
+                            result.checks.append("the Object Storage key copy decrypts to the current key")
+                        else:
+                            result.problems.append("the Object Storage key copy isn't the current key")
+                    except engine.ConfigError as e:
+                        result.problems.append(f"the Object Storage key copy doesn't decrypt: {e}")
+    if os.environ.get(ENV_BACKUP_RECIPIENTS_ENV, "").strip():
+        blob = None
+        with contextlib_suppress(Exception):
+            blob = osb.download_deployment_file(ENV_BACKUP_OBJECT_NAME)
+        if blob is None or not blob.startswith(b"age-encryption.org/v1"):
+            result.problems.append("the encrypted settings copy (env.age) is missing or not age-encrypted")
+        else:
+            result.checks.append("the encrypted settings copy is present (only your age key opens it)")
+    result.ok = not result.problems
+    _record_backup_verify(result, now)
+    return result
+
+
+def _record_backup_verify(result: BackupVerifyResult, now: datetime) -> None:
+    def _do():
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT INTO backup_verify_status (id, checked_at, ok, snapshot_key, problems) "
+                "VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET checked_at = excluded.checked_at, "
+                "ok = excluded.ok, snapshot_key = excluded.snapshot_key, problems = excluded.problems",
+                (now.isoformat(), 1 if result.ok else 0, result.snapshot_key, json.dumps(result.problems)))
+            conn.commit()
+        finally:
+            conn.close()
+
+    with contextlib_suppress(Exception):
+        _retry_db(_do)
+
+
+def backup_verify_status() -> dict | None:
+    def _do():
+        conn = _connect()
+        try:
+            return conn.execute("SELECT checked_at, ok, snapshot_key, problems FROM "
+                                "backup_verify_status WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+
+    row = None
+    with contextlib_suppress(Exception):
+        row = _retry_db(_do)
+    if row is None:
+        return None
+    return {"checked_at": row[0], "ok": bool(row[1]), "snapshot_key": row[2],
+            "problems": json.loads(row[3] or "[]")}
+
+
 def _backup_problems(result: BackupResult) -> list[str]:
     problems = []
     if result.instances_failed:
@@ -6910,6 +7211,14 @@ def default_backup_dir() -> Path | None:
     return candidate if candidate.is_dir() else None
 
 
+RUNTIME_RELOADABLE_KEYS = (
+    "LIS_ALERT_WEBHOOK_URL", "LIS_ALERT_EMAIL_TO", "LIS_ALERT_SMTP_HOST", "LIS_ALERT_SMTP_PORT",
+    "LIS_ALERT_SMTP_SECURITY", "LIS_ALERT_SMTP_USER", "LIS_ALERT_SMTP_PASSWORD",
+    "LIS_ALERT_EMAIL_FROM", "LIS_ENV_BACKUP_RECIPIENTS", "LIS_HEARTBEAT_URL",
+    "LIS_BACKUP_KEEP_ALL_HOURS", "LIS_BACKUP_KEEP_DAILY_DAYS",
+)
+
+
 def reload_object_storage_settings_if_changed() -> bool:
 
     global _env_mtime
@@ -6924,7 +7233,7 @@ def reload_object_storage_settings_if_changed() -> bool:
         return False
     _env_mtime = mtime
     values = dotenv_values(ENV_PATH)
-    for key in osb.SETTING_KEYS:
+    for key in tuple(osb.SETTING_KEYS) + RUNTIME_RELOADABLE_KEYS:
         value = values.get(key)
         if value:
             os.environ[key] = value
@@ -6988,7 +7297,8 @@ def get_system_backup_status() -> dict:
     return {"object_storage": osb.settings_summary(),
             "local_backup_dir": str(local) if local else None,
             "last_backup": last, "continuous": continuous,
-            "ssh_key": deployment_key_status(), "env_backup": env_backup_status()}
+            "ssh_key": deployment_key_status(), "env_backup": env_backup_status(),
+            "verify": backup_verify_status(), "lease": lease_state()}
 
 
 def configure_system_backup(bucket: str, endpoint: str, access_key: str, secret_key: str, *,
@@ -7496,6 +7806,7 @@ _ENV_BACKUP_KEYS = (
     "LIS_ALERT_WEBHOOK_URL", "LIS_ALERT_EMAIL_TO", "LIS_ALERT_SMTP_HOST", "LIS_ALERT_SMTP_PORT",
     "LIS_ALERT_SMTP_SECURITY", "LIS_ALERT_SMTP_USER", "LIS_ALERT_SMTP_PASSWORD",
     "LIS_ALERT_EMAIL_FROM", "LIS_ENV_BACKUP_RECIPIENTS", "LINODE_SCHEDULER_BACKUP_DIR",
+    "LIS_HEARTBEAT_URL",
 )
 ENV_BACKUP_STALE_SECONDS = 15 * 60
 
@@ -9524,6 +9835,13 @@ class PollScheduler:
         self._maintenance_future: Future | None = None
         self._last_reconcile: datetime | None = None
         self._last_key_protect: datetime | None = None
+        self._last_verify: datetime | None = None
+        self._started_at = datetime.now(UTC)
+        self._lease_checked_at: datetime | None = None
+        self._last_ping: datetime | None = None
+        self._last_ping_ok: bool | None = None
+        self._lease_active = True
+        self._lease_reported: str | None = None
         self._mismatches_reported: frozenset[str] | None = None
 
     @property
@@ -9578,6 +9896,9 @@ class PollScheduler:
             if reload_object_storage_settings_if_changed() and self._on_progress is not None:
                 self._on_progress("Object Storage backup settings changed in .env -- reloaded.")
         completed = self.take_completed()
+        if not self._lease_held(datetime.now(UTC)):
+
+            return PollTickResult(results=completed)
         with self._lock:
             in_flight = set(self._in_flight)
         tick = poll_tick(
@@ -9593,13 +9914,56 @@ class PollScheduler:
         self._start_maintenance(now)
         return PollTickResult(results=completed + tick.results)
 
+    def _lease_held(self, now: datetime) -> bool:
+
+        last = self._lease_checked_at
+        if last is not None and (now - last).total_seconds() < LEASE_RENEW_SECONDS:
+            return self._lease_active
+        self._lease_checked_at = now
+        status = acquire_or_renew_lease(now=now)
+        if status.active != self._lease_active or self._lease_reported is None:
+            self._lease_reported = status.role
+            if status.active:
+                message = (f"scheduler active ({status.detail})" if status.detail
+                           else "scheduler active (holds the lease)")
+                record_activity(message, source="scheduler", action="lease")
+                if self._on_progress is not None:
+                    self._on_progress(message)
+            else:
+                holder = status.holder or {}
+                message = (f"STANDING BY: another scheduler ({holder.get('host')}) holds the lease "
+                           f"-- nothing is started or stopped here. If that host is gone for good, "
+                           "run `scheduler-lease --take-over` here.")
+                record_activity(message, level="error", source="scheduler", action="lease")
+                if self._on_warning is not None:
+                    self._on_warning(f"WARNING: {message}")
+        self._lease_active = status.active
+        return status.active
+
     def _start_maintenance(self, now: datetime) -> None:
         if self._maintenance_future is not None and not self._maintenance_future.done():
             return
         self._maintenance_future = self._maintenance.submit(self.run_maintenance, now)
 
+    def _ping_heartbeat(self, now: datetime) -> None:
+        url = os.environ.get(HEARTBEAT_URL_ENV, "").strip()
+        if not url or (self._last_ping is not None
+                       and (now - self._last_ping).total_seconds() < HEARTBEAT_INTERVAL_SECONDS):
+            return
+        self._last_ping = now
+        ok = False
+        with contextlib_suppress(Exception):
+            import requests as _requests
+            ok = _requests.get(url, timeout=10).status_code < 400
+        if ok != self._last_ping_ok:
+            self._last_ping_ok = ok
+            record_activity(f"heartbeat ping to {HEARTBEAT_URL_ENV} {'works' if ok else 'is failing'}",
+                            level="info" if ok else "warning", source="scheduler", action="heartbeat")
+
     def run_maintenance(self, now: datetime) -> None:
 
+        with contextlib_suppress(Exception):
+            self._ping_heartbeat(now)
         with contextlib_suppress(Exception):
             run_continuous_backup_if_due(now=now)
         with contextlib_suppress(Exception):
@@ -9617,7 +9981,19 @@ class PollScheduler:
             with contextlib_suppress(Exception):
                 self._report_schedule_mismatches(now)
             with contextlib_suppress(Exception):
-                evaluate_alerts(now=now, include_scheduler=False)
+                evaluate_alerts(now=now, include_scheduler=False, client=self._client)
+        if ((self._last_verify is None and (now - self._started_at).total_seconds() >= 600)
+                or (self._last_verify is not None and (now - self._last_verify).total_seconds()
+                    >= BACKUP_VERIFY_INTERVAL_SECONDS)):
+            self._last_verify = now
+            with contextlib_suppress(Exception):
+                if osb.is_configured():
+                    verify = verify_backups(now=now)
+                    record_activity(
+                        f"backup restore test: {'passed' if verify.ok else 'FAILED'} "
+                        f"({verify.snapshot_key}){'' if verify.ok else ': ' + '; '.join(verify.problems)}",
+                        level="info" if verify.ok else "error", source="scheduler",
+                        action="backup-verify")
         if (self._last_key_protect is None
                 or (now - self._last_key_protect).total_seconds() >= 3600):
             self._last_key_protect = now
@@ -9651,6 +10027,8 @@ class PollScheduler:
 
         self._executor.shutdown(wait=True, cancel_futures=True)
         self._maintenance.shutdown(wait=True, cancel_futures=True)
+        if self._lease_active:
+            release_lease()
 
 
 def _hms(moment: datetime) -> str:
@@ -9723,6 +10101,13 @@ def cmd_poll(client, args) -> int:
     args.max_parallel = max_parallel
     client_factory = _per_thread_client_factory() if max_parallel > 1 else None
     if args.once:
+        lease = acquire_or_renew_lease()
+        if not lease.active:
+            holder = (lease.holder or {}).get("host")
+            print(f"Standing by: another scheduler ({holder}) holds the lease -- nothing done. "
+                  "Run `scheduler-lease --take-over` here only if that host is gone for good.",
+                  file=sys.stderr)
+            return 1
         tick = poll_tick(
             client, args.ssh_key, window_seconds=args.window_seconds,
             max_parallel=args.max_parallel, client_factory=client_factory,
@@ -10389,10 +10774,68 @@ class HealthProblem:
     message: str
 
 
-def check_health(*, now: datetime | None = None, include_scheduler: bool = True) -> list[HealthProblem]:
+TOKEN_EXPIRY_WARN_DAYS = 14
+DISK_FREE_MIN_BYTES = 1024 ** 3
+DISK_FREE_MIN_FRACTION = 0.05
+_token_check_cache: dict = {"at": None, "problems": []}
+
+
+def token_health(client, *, now: datetime | None = None) -> list[HealthProblem]:
 
     now = now or datetime.now(UTC)
+    cached_at = _token_check_cache["at"]
+    if cached_at is not None and (now - cached_at).total_seconds() < 3600:
+        return list(_token_check_cache["problems"])
     problems: list[HealthProblem] = []
+    try:
+        engine.auth_check(client)
+    except Exception as e:
+        problems.append(HealthProblem("api-token", f"the Linode API token is being rejected: {e}"))
+    else:
+        with contextlib_suppress(Exception):
+            token = engine.load_token()
+            for t in engine.retry_transient(lambda: list(client.profile.tokens())):
+                shown = (t.token or "").rstrip("*")
+                if len(shown) >= 8 and token.startswith(shown):
+                    expiry = t.expiry
+                    if isinstance(expiry, datetime):
+                        expiry = expiry if expiry.tzinfo else expiry.replace(tzinfo=UTC)
+                        days = (expiry - now).total_seconds() / 86400
+                        if days <= TOKEN_EXPIRY_WARN_DAYS:
+                            problems.append(HealthProblem(
+                                "api-token-expiry",
+                                f"the Linode API token ('{t.label}') expires "
+                                f"{expiry.strftime('%Y-%m-%d')} -- create a new one and put it in "
+                                "LINODE_API_TOKEN before then"))
+                    break
+    with contextlib_suppress(Exception):
+        host = set_host_watchdog(client, enable=None)
+        if host and not host["watchdog_enabled"]:
+            problems.append(HealthProblem(
+                "watchdog", f"Shutdown Watchdog is off on this scheduler's host ({host['label']}): "
+                "if it crashes it stays down -- turn it on with `host-watchdog --enable`"))
+    _token_check_cache.update(at=now, problems=problems)
+    return problems
+
+
+def disk_health() -> list[HealthProblem]:
+    try:
+        usage = shutil.disk_usage(REGISTRY_PATH.parent if REGISTRY_PATH.parent.exists() else Path("."))
+    except OSError:
+        return []
+    if usage.free < DISK_FREE_MIN_BYTES or usage.free < usage.total * DISK_FREE_MIN_FRACTION:
+        return [HealthProblem("disk", f"only {usage.free // (1024 ** 2)} MB free on the disk holding "
+                              "the database -- writes will start failing when it fills")]
+    return []
+
+
+def check_health(*, now: datetime | None = None, include_scheduler: bool = True,
+                 client=None) -> list[HealthProblem]:
+
+    now = now or datetime.now(UTC)
+    problems: list[HealthProblem] = list(disk_health())
+    if client is not None:
+        problems += token_health(client, now=now)
     if include_scheduler:
         beat = None
         with contextlib_suppress(Exception):
@@ -10428,6 +10871,20 @@ def check_health(*, now: datetime | None = None, include_scheduler: bool = True)
         if missing:
             problems.append(HealthProblem(
                 "ssh-key", "the deployment SSH key isn't fully protected: " + ", ".join(missing)))
+    lease = lease_state()
+    if lease is not None and lease["role"] == "standby":
+        problems.append(HealthProblem(
+            "lease", f"this scheduler is standing by: {lease['holder_host']} holds the scheduler "
+            "lease, so nothing is started or stopped from here. If that host is gone for good, "
+            "run `scheduler-lease --take-over`."))
+    verify = backup_verify_status()
+    if verify is not None and not verify["ok"]:
+        problems.append(HealthProblem(
+            "backup-verify", "the backup restore test failed: " + "; ".join(verify["problems"])[:300]))
+    elif (verify is not None and osb.is_configured()
+          and (now - datetime.fromisoformat(verify["checked_at"])).total_seconds()
+          > 2 * BACKUP_VERIFY_INTERVAL_SECONDS + 3600):
+        problems.append(HealthProblem("backup-verify", "the backups haven't been restore-tested for two days"))
     with contextlib_suppress(Exception):
         env = env_backup_status()
         if env["configured"] and env["last_error"]:
@@ -10485,6 +10942,61 @@ def alert_channels() -> dict:
     }
 
 
+ALERT_SETTING_KEYS = {
+    "webhook_url": "LIS_ALERT_WEBHOOK_URL", "email_to": "LIS_ALERT_EMAIL_TO",
+    "smtp_host": "LIS_ALERT_SMTP_HOST", "smtp_port": "LIS_ALERT_SMTP_PORT",
+    "smtp_security": "LIS_ALERT_SMTP_SECURITY", "smtp_user": "LIS_ALERT_SMTP_USER",
+    "smtp_password": "LIS_ALERT_SMTP_PASSWORD", "email_from": "LIS_ALERT_EMAIL_FROM",
+}
+_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+
+
+def alert_settings_summary() -> dict:
+
+    env = os.environ
+    url = env.get("LIS_ALERT_WEBHOOK_URL", "").strip()
+    host = ""
+    if url:
+        with contextlib_suppress(Exception):
+            from urllib.parse import urlparse
+            host = urlparse(url).hostname or ""
+    return {
+        "webhook_set": bool(url), "webhook_host": host or None,
+        "email_to": alert_channels()["email_to"],
+        "smtp_host": env.get("LIS_ALERT_SMTP_HOST", "").strip() or None,
+        "smtp_port": env.get("LIS_ALERT_SMTP_PORT", "").strip() or None,
+        "smtp_security": env.get("LIS_ALERT_SMTP_SECURITY", "").strip() or "starttls",
+        "smtp_user": env.get("LIS_ALERT_SMTP_USER", "").strip() or None,
+        "smtp_password_set": bool(env.get("LIS_ALERT_SMTP_PASSWORD", "")),
+        "email_from": env.get("LIS_ALERT_EMAIL_FROM", "").strip() or None,
+    }
+
+
+def configure_alerts(changes: dict[str, str | None]) -> dict:
+
+    updates: dict[str, str | None] = {}
+    for field_name, value in changes.items():
+        if field_name not in ALERT_SETTING_KEYS:
+            raise engine.ConfigError(f"unknown alert setting '{field_name}'")
+        value = (value or "").strip() if field_name != "smtp_password" else (value or "")
+        if field_name == "webhook_url" and value and not value.startswith(("https://", "http://")):
+            raise engine.ConfigError("the webhook URL must start with https:// (or http://)")
+        if field_name in ("email_to", "email_from") and value:
+            for addr in [a.strip() for a in value.split(",") if a.strip()]:
+                if not _EMAIL_RE.match(addr):
+                    raise engine.ConfigError(f"'{addr}' isn't an email address")
+        if field_name == "smtp_port" and value and not (value.isdigit() and 0 < int(value) < 65536):
+            raise engine.ConfigError("the SMTP port must be a number from 1 to 65535")
+        if field_name == "smtp_security" and value and value not in ("starttls", "ssl", "none"):
+            raise engine.ConfigError("SMTP security must be starttls, ssl or none")
+        updates[ALERT_SETTING_KEYS[field_name]] = value or None
+    if updates:
+        _write_env_settings(updates)
+        record_activity("alert settings changed: " + ", ".join(sorted(changes)), source="system",
+                        action="alerts-config")
+    return alert_settings_summary()
+
+
 def _send_webhook(text: str, event: str, details: dict) -> bool:
     url = os.environ.get(ALERT_WEBHOOK_ENV, "").strip()
     if not url:
@@ -10538,10 +11050,11 @@ def send_alert(text: str, *, event: str, details: dict | None = None) -> bool:
     return delivered
 
 
-def evaluate_alerts(*, now: datetime | None = None, include_scheduler: bool = True) -> list[HealthProblem]:
+def evaluate_alerts(*, now: datetime | None = None, include_scheduler: bool = True,
+                    client=None) -> list[HealthProblem]:
 
     now = now or datetime.now(UTC)
-    problems = check_health(now=now, include_scheduler=include_scheduler)
+    problems = check_health(now=now, include_scheduler=include_scheduler, client=client)
     current = {p.key: p for p in problems}
     try:
         previous = _alert_state()
@@ -10626,7 +11139,7 @@ def find_schedule_mismatches(*, now: datetime | None = None,
         if (missed_at is not None
                 and (now - missed_at).total_seconds() < DEFAULT_POLL_CATCH_UP_SECONDS + 300):
             continue
-        by_hand = bool(missed_at is not None and transition_recorded_since(name, missed_at))
+        by_hand = bool(missed_at is not None and _changed_by_hand_since(name, missed_at, current))
         if by_hand:
             reason = (f"{'started' if current == 'running' else 'stopped'} by hand after the "
                       "scheduled time")
@@ -10640,6 +11153,18 @@ def find_schedule_mismatches(*, now: datetime | None = None,
             missed_at=missed_at.isoformat() if missed_at else None,
             changed_by_hand=by_hand, reason=reason))
     return mismatches
+
+
+def _changed_by_hand_since(name: str, since: datetime, current: str) -> bool:
+
+    wanted = "create" if current == "running" else "delete"
+    for event in get_schedule_events(name, limit=200):
+        if event["result"] != "success" or event["action"] not in ("create", "delete"):
+            continue
+        if datetime.fromisoformat(event["timestamp"]) < since:
+            return False
+        return event["triggered_by"] in ("manual", "api") and event["action"] == wanted
+    return False
 
 
 @dataclass
@@ -11286,15 +11811,105 @@ def cmd_schedule_catch_up(client, args) -> int:
     return 0 if result.ok else 1
 
 
+def cmd_host_watchdog(client, args) -> int:
+    enable = True if args.enable else (False if args.disable else None)
+    info = set_host_watchdog(client, enable=enable)
+    if not info:
+        print("This host isn't a Linode instance on this account (e.g. a Kubernetes pod) -- "
+              "nothing to set.")
+        return 0
+    print(f"{info['label']} (instance {info['instance_id']}): Shutdown Watchdog "
+          f"{'on' if info['watchdog_enabled'] else 'OFF'}")
+    return 0
+
+
+def cmd_scheduler_lease(args) -> int:
+    if not osb.is_configured():
+        print("Object Storage isn't configured: there's no shared lease, so make sure only one "
+              "scheduler runs.")
+        return 0
+    if args.take_over:
+        lease = read_lease()
+        if (lease is not None and lease.get("id") != scheduler_id() and not args.yes
+                and _lease_age_seconds(lease, datetime.now(UTC)) < LEASE_TTL_SECONDS):
+            print(f"{lease.get('host')} renewed the lease {int(_lease_age_seconds(lease, datetime.now(UTC)))}s "
+                  "ago -- it looks alive. Taking over while it runs means two schedulers until it "
+                  "notices (within a minute) and stands by.")
+            if input("Take over anyway? [y/N] ").strip().lower() != "y":
+                print("Aborted.")
+                return 1
+        status = acquire_or_renew_lease(take_over=True)
+        print("This host now holds the scheduler lease." if status.active
+              else f"Couldn't take the lease: {status.detail}")
+        return 0 if status.active else 1
+    lease = read_lease()
+    if lease is None:
+        print("No scheduler holds the lease.")
+        return 0
+    age = int(_lease_age_seconds(lease, datetime.now(UTC)))
+    who = "this host" if lease.get("id") == scheduler_id() else lease.get("host")
+    fresh = age < LEASE_TTL_SECONDS
+    print(f"Held by {who} -- renewed {age}s ago ({'active' if fresh else 'expired'}).")
+    return 0
+
+
+def cmd_backup_verify(args) -> int:
+    result = verify_backups()
+    for check in result.checks:
+        print(f"ok: {check}")
+    for problem in result.problems:
+        print(f"PROBLEM: {problem}", file=sys.stderr)
+    print("Backup restore test passed." if result.ok else "Backup restore test FAILED.")
+    return 0 if result.ok else 1
+
+
 def cmd_alerts_check(args) -> int:
 
-    problems = evaluate_alerts() if args.send else check_health()
+    client = None
+    with contextlib_suppress(Exception):
+        client = engine.build_client(engine.load_token())
+    problems = (evaluate_alerts(client=client) if args.send
+                else check_health(client=client))
     if not problems:
         print("OK: nothing needs attention.")
         return 0
     for p in problems:
         print(f"PROBLEM [{p.key}]: {p.message}")
     return 1
+
+
+def cmd_alerts_config(args) -> int:
+    changes: dict[str, str | None] = {}
+    for field_name in ("webhook_url", "email_to", "smtp_host", "smtp_port", "smtp_security",
+                       "smtp_user", "email_from"):
+        value = getattr(args, field_name, None)
+        if value is not None:
+            changes[field_name] = value
+    if args.smtp_password:
+        import getpass
+        changes["smtp_password"] = getpass.getpass("SMTP password: ")
+    if args.clear_email:
+        changes.update({k: "" for k in ("email_to", "smtp_host", "smtp_port", "smtp_security",
+                                         "smtp_user", "smtp_password", "email_from")})
+    if args.clear_webhook:
+        changes["webhook_url"] = ""
+    try:
+        summary = configure_alerts(changes) if changes else alert_settings_summary()
+    except engine.ConfigError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 1
+    print(f"Webhook: {summary['webhook_host'] or 'not set'}")
+    if summary["email_to"]:
+        print(f"Email to {', '.join(summary['email_to'])} via {summary['smtp_host']}:"
+              f"{summary['smtp_port'] or ('465' if summary['smtp_security'] == 'ssl' else '587')} "
+              f"({summary['smtp_security']}), user {summary['smtp_user'] or '-'}, password "
+              f"{'set' if summary['smtp_password_set'] else 'not set'}, from "
+              f"{summary['email_from'] or summary['smtp_user'] or '(default)'}")
+    else:
+        print("Email: not set")
+    if changes:
+        print("Saved. Send a test with `alerts-test`.")
+    return 0
 
 
 def cmd_alerts_test(args) -> int:
@@ -11383,6 +11998,32 @@ def scheduler_host_addresses(client) -> set[str]:
             addresses |= set(inst.ipv4 or [])
     addresses |= {ip.nat_1_1 for ip in vpc_ips if ip.linode_id in own and getattr(ip, "nat_1_1", None)}
     return addresses
+
+
+def scheduler_instance(client):
+
+    local = _local_ipv4_addresses()
+    instances = engine.retry_transient(lambda: list(client.linode.instances()))
+    for inst in instances:
+        if local & set(inst.ipv4 or []):
+            return inst
+    vpc_ips = engine.retry_transient(lambda: list(client.vpcs.ips()))
+    ids = {ip.linode_id for ip in vpc_ips if ip.address in local and ip.linode_id}
+    return next((i for i in instances if i.id in ids), None)
+
+
+def set_host_watchdog(client, *, enable: bool | None = True) -> dict:
+
+    inst = scheduler_instance(client)
+    if inst is None:
+        return {}
+    if enable is not None and bool(inst.watchdog_enabled) != enable:
+        inst.watchdog_enabled = enable
+        engine.retry_transient(inst.save)
+        inst = engine.retry_transient(lambda: client.load(Instance, inst.id))
+        record_activity(f"Shutdown Watchdog {'enabled' if enable else 'disabled'} on this "
+                        f"scheduler's host ({inst.label})", source="system", action="watchdog")
+    return {"instance_id": inst.id, "label": inst.label, "watchdog_enabled": bool(inst.watchdog_enabled)}
 
 
 def _vlan_labels(network_config: list[dict] | None, model: str | None) -> list[str]:
@@ -11994,7 +12635,10 @@ def _discover_from_object_storage(
     names = osb.list_instance_backups() if osb.is_configured() else None
     added: list[str] = []
     for name in names or []:
-        if name in found:
+        partial = found.get(name)
+
+
+        if partial is not None and (partial.get("os_volume_id_candidates") or partial.get("os_volume_id")):
             continue
         try:
             engine.validate_instance_name(name)
@@ -12031,6 +12675,10 @@ def _discover_from_object_storage(
                     ip = None
             region = getattr(volume, "region", None)
             region_id = getattr(region, "id", region)
+            if partial is not None:
+
+                data_ids = sorted(set(data_ids) | set(partial.get("data_volume_ids") or []))
+                ip = partial.get("reserved_ip") or ip
             found[name] = {
                 "os_volume_id": os_id, "os_volume_id_candidates": [os_id],
                 "data_volume_ids": sorted(data_ids), "reserved_ip": ip,
@@ -12714,6 +13362,10 @@ API_TOKEN_FINE_SCOPES: dict[str, str] = {
     "instances:extend": "extend a manual-override window",
     "instances:clear-lock": "clear a stuck in-progress mark (only when no start/stop is running)",
     "schedules:catch-up": "start/stop nodes that missed their schedule (after review)",
+    "system:read": "backup, key-protection, restore-test, lease, watchdog and alert status",
+    "system:backup": "run a backup, a restore test, the settings backup, key protection",
+    "system:configure": "heal, take over the scheduler lease, Shutdown Watchdog, the age key for "
+                        "the settings backup (credentials -- Object Storage, SMTP -- stay admin-only)",
     "groups:start": "start a whole group",
     "groups:stop": "stop a whole group",
     "schedules:read": "read an instance's schedule",
@@ -13665,6 +14317,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "deployment key not fully protected, nodes off schedule); exit 1 if so. --send also "
         f"sends/clears alerts to {ALERT_WEBHOOK_ENV}.")
     alerts_check_parser.add_argument("--send", action="store_true")
+    wd_parser = subparsers.add_parser(
+        "host-watchdog",
+        help="Linode's Shutdown Watchdog on this scheduler's own instance: if it crashes or powers "
+        "off unexpectedly, Linode boots it again. Shows it; --enable/--disable change it.")
+    wd_group = wd_parser.add_mutually_exclusive_group()
+    wd_group.add_argument("--enable", action="store_true")
+    wd_group.add_argument("--disable", action="store_true")
+    lease_parser = subparsers.add_parser(
+        "scheduler-lease",
+        help="Which host is the active scheduler (the lease in Object Storage); --take-over makes "
+        "this host the active one -- only when the other host is gone for good.")
+    lease_parser.add_argument("--take-over", action="store_true")
+    lease_parser.add_argument("--yes", action="store_true")
+    subparsers.add_parser(
+        "backup-verify",
+        help="Restore-test the backups now: download the newest snapshot, check it, and check the "
+        "stored copies of the SSH key decrypt (the scheduler does this daily).")
+    ac = subparsers.add_parser(
+        "alerts-config",
+        help="Show or change where alerts go: a webhook and/or email over SMTP. Running services "
+        "pick changes up without a restart.")
+    ac.add_argument("--webhook-url", dest="webhook_url", help="Slack/Teams/any JSON-POST URL ('' clears).")
+    ac.add_argument("--email-to", dest="email_to", help="Comma-separated recipients.")
+    ac.add_argument("--smtp-host", dest="smtp_host")
+    ac.add_argument("--smtp-port", dest="smtp_port", help="587 (starttls, default) or 465 (ssl).")
+    ac.add_argument("--smtp-security", dest="smtp_security", choices=("starttls", "ssl", "none"))
+    ac.add_argument("--smtp-user", dest="smtp_user")
+    ac.add_argument("--smtp-password", action="store_true", help="Prompt for the SMTP password.")
+    ac.add_argument("--email-from", dest="email_from")
+    ac.add_argument("--clear-email", action="store_true", help="Turn email alerts off.")
+    ac.add_argument("--clear-webhook", action="store_true", help="Turn webhook alerts off.")
     subparsers.add_parser("alerts-test", help="Send a test alert to every configured channel "
                           f"({ALERT_WEBHOOK_ENV}, and email via {ALERT_EMAIL_ENV} + SMTP settings).")
 
@@ -14015,6 +14698,12 @@ def _route(args) -> int:
         return cmd_env_backup_keygen(args)
     if args.command == "alerts-test":
         return cmd_alerts_test(args)
+    if args.command == "alerts-config":
+        return cmd_alerts_config(args)
+    if args.command == "backup-verify":
+        return cmd_backup_verify(args)
+    if args.command == "scheduler-lease":
+        return cmd_scheduler_lease(args)
     if args.command == "deregister":
         return cmd_deregister(args)
     if args.command == "backup-list":
@@ -14105,6 +14794,8 @@ def _route(args) -> int:
         return cmd_backup_delete(client, args)
     if args.command == "heal":
         return cmd_heal(client, args)
+    if args.command == "host-watchdog":
+        return cmd_host_watchdog(client, args)
     if args.command == "migrate-abandon":
         return cmd_migrate_abandon(client, args)
     if args.command == "schedule-catch-up":

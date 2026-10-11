@@ -295,6 +295,9 @@ Every command below is run from the repository root, with the virtual environmen
 | `schedule-catch-up` | Lists nodes that aren't in the state their schedule wants (after an outage longer than the scheduler's one-hour catch-up window); `--apply` starts/stops them after you confirm. See §8.15. |
 | `migrate-abandon` | Cancels an unfinished migration: the original instance boots from its own disk again and the copy's volume is deleted. See §6.4. |
 | `env-backup` / `env-restore` | Your own encrypted copy of the settings (`.env`) and the deployment SSH key, encrypted to your age public key — only you can open it. See §8.10. |
+| `backup-verify` | Restore-tests the backups now (the scheduler does it daily). See §8.15. |
+| `scheduler-lease` | Which host is the active scheduler; `--take-over` makes this one active. See §8.15. |
+| `host-watchdog` | Linode's Shutdown Watchdog on the scheduler's own host; `--enable` turns it on. See §8.15. |
 | `alerts-check` / `alerts-test` | Show what needs attention right now (exit 1 if anything) / send a test alert. Alerts go to a webhook and/or email. See §8.15. |
 | `reset-host-key` | Admin escape hatch — re-establishes SSH trust for a node after a genuine, confirmed key change. You should rarely need this either; see [§8](#8-day-to-day-usage) and the one-time migration note below. |
 | `rebuild` | Disaster recovery — reconstructs your local registry from tags on your own Linode account, in case the machine running this tool (and its local records) is ever lost. You should rarely need this either. |
@@ -1610,8 +1613,11 @@ Storage keys or a snapshot. Check it any time:
 python instance_manager.py ssh-key-protect
 ```
 
-**Your own encrypted copy of the settings.** Set your age public key (make the keypair on your own
-machine with `age-keygen -o key.txt`) and the scheduler keeps the whole `.env` and the deployment SSH
+**Your own encrypted copy of the settings.** First create an age key on your own computer (not the
+server): install age (`brew install age` on macOS, `sudo apt install age` on Ubuntu/Debian,
+`sudo dnf install age` on Fedora/RHEL, `winget install --id FiloSottile.age` on Windows), then run
+`age-keygen -o lis-age-key.txt`. It prints `Public key: age1…`; keep `lis-age-key.txt` (the secret
+part) in your password manager. Set that public key and the scheduler keeps the whole `.env` and the deployment SSH
 key in your bucket, encrypted so only your `key.txt` opens them — this host can write them but not
 read them back. They're re-uploaded whenever either changes:
 
@@ -1905,6 +1911,8 @@ python instance_manager.py api-token-create --name nightly-stop --scopes instanc
 | `logs:read` | Service log files |
 | `instances:start` / `instances:stop` | Start / stop a node |
 | `instances:extend` | Extend a manual-override timer |
+| `instances:clear-lock` | Clear a stuck in-progress mark (refused while a start/stop really runs) |
+| `schedules:catch-up` | Start/stop nodes that missed their schedule, after review |
 | `groups:start` / `groups:stop` | Start / stop a whole group |
 | `schedules:read` / `schedules:write` | Read / set or clear a node's schedule |
 | `groups:read` | List and view groups |
@@ -1918,6 +1926,12 @@ python instance_manager.py api-token-create --name nightly-stop --scopes instanc
 | `instances:offboard` | Offboard a node or remove it from tracking |
 | `instances:vpc-address` | Move a stopped node to another VPC address |
 | `tokens:manage` | Create, list and revoke tokens — never one wider than itself |
+| `system:read` | Backup, key-protection, restore-test, lease, watchdog and alert status |
+| `system:backup` | Run a backup, a restore test, the settings backup, key protection |
+| `system:configure` | Heal, take over the scheduler lease, Shutdown Watchdog, the age key for the settings backup |
+
+Settings that hold credentials -- Object Storage keys, the SMTP password -- can only be changed with
+an `admin` token or a dashboard login.
 
 `python instance_manager.py api-token-scopes` prints this list. A request without the scope it
 needs is refused with `403` naming the missing scope; anything not on this list needs `admin`.
@@ -2041,6 +2055,43 @@ new accounts until support opens them.
 python instance_manager.py alerts-test        # send a test alert
 python instance_manager.py alerts-check       # what needs attention now (exit 1 if anything)
 ```
+
+Alerts also cover a failed daily restore test of the backups, the Linode API token being rejected
+or expiring within 14 days, the disk holding the database nearly full, and Shutdown Watchdog being
+off on the scheduler's host.
+
+**Setting up email alerts.** On the dashboard's System backup page, fill in the Alerts form: who
+to send to, your SMTP server, port, security, user and password, then **Save** and **Send test
+alert**. Or from the command line:
+
+```
+python instance_manager.py alerts-config --email-to ops@example.com --smtp-host smtp.gmail.com \
+    --smtp-port 587 --smtp-user you@example.com --smtp-password     # prompts for the password
+python instance_manager.py alerts-test
+```
+
+Use the SMTP server of a mail account you already have (Google Workspace: `smtp.gmail.com`, port
+587, with an app password; Microsoft 365: `smtp.office365.com`, 587) or a sending service
+(SendGrid, Mailgun, Amazon SES, Brevo). Linode blocks outbound SMTP ports (25, 465, 587) on new
+accounts until you ask support to open them; a service that accepts port 2525 works without that.
+For a webhook, `--webhook-url` (Slack: an incoming-webhook URL; Teams: a workflow webhook URL).
+The running services pick the change up without a restart.
+
+**When the whole host is gone,** nothing on it can alert you. Linode's Shutdown Watchdog (turned on
+by `install.sh`; `host-watchdog --enable`) boots the host again after a crash, and
+`LIS_HEARTBEAT_URL` sends a ping every minute to an uptime monitor of your choice (Healthchecks.io,
+Better Stack, Uptime Kuma), which tells you when the pings stop.
+
+**One active scheduler.** With Object Storage, the active scheduler holds a lease in the bucket. A
+second scheduler (an old host coming back after you recovered onto a new one) finds the lease and
+stands by -- it starts, stops and uploads nothing, and alerts. `scheduler-lease` shows who's
+active; `scheduler-lease --take-over` (or the System backup page) moves it, only once you're sure
+the other host is gone.
+
+**Restore testing.** Every day the newest snapshot is downloaded and checked, and the stored key
+copies decrypted, without touching the live database (`backup-verify` on demand). A damaged
+database is never uploaded. Upgrading with `install.sh install` takes a snapshot first, in
+`backups/pre-upgrade-<time>/`.
 
 ## 9. Costs
 

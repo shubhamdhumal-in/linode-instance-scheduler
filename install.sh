@@ -20,6 +20,7 @@ SSH_KEY_FROM_BACKUP=0
 NEW_SSH_KEY=0
 NEW_PASSPHRASE=""
 ENV_BACKUP_RECIPIENT=""
+HEARTBEAT_URL=""
 ENV_FROM_BACKUP=0
 AGE_IDENTITY=""
 KEY_FROM_SNAPSHOT=0
@@ -80,6 +81,9 @@ Options:
                             install: your age public key (age1...). An encrypted copy of .env and
                             the SSH key is kept in Object Storage that only your age identity opens
                             (asked interactively if not given)
+  --heartbeat-url URL       A URL from an uptime monitor (Healthchecks.io, Better Stack, Uptime
+                            Kuma...) that the scheduler pings every minute -- the monitor alerts you
+                            if the pings stop, e.g. when this whole host is gone
   --env-from-backup         recover: take every setting and the SSH key from that encrypted copy --
                             asks only for the bucket settings and your age identity
   --age-identity PATH       recover: file with your AGE-SECRET-KEY line (else asked for)
@@ -117,6 +121,7 @@ while [[ $# -gt 0 ]]; do
     --backup-ssh-key) shift ;;  # the key is always stored now; kept for older scripts
     --passphrase-file) PASSPHRASE_FILE="$2"; shift 2 ;;
     --env-backup-recipient) ENV_BACKUP_RECIPIENT="$2"; shift 2 ;;
+    --heartbeat-url) HEARTBEAT_URL="$2"; shift 2 ;;
     --env-from-backup) ENV_FROM_BACKUP=1; shift ;;
     --age-identity) AGE_IDENTITY="$2"; shift 2 ;;
     --no-api) WITH_API=0; shift ;;
@@ -321,6 +326,7 @@ configure_env() {
     warn "LINODE_OAUTH_REDIRECT_URI doesn't match https://$DOMAIN/oauth/callback -- login only works when the OAuth app's callback URL, .env and the domain all agree."
   fi
   stage_set LINODE_SSH_KEY_PATH "$KEY_PATH"
+  [[ -n "$HEARTBEAT_URL" ]] && stage_set LIS_HEARTBEAT_URL "$HEARTBEAT_URL"
   if [[ -n "$ENV_BACKUP_RECIPIENT" ]]; then
     stage_set LIS_ENV_BACKUP_RECIPIENTS "$ENV_BACKUP_RECIPIENT"
   elif [[ $ASSUME_YES -eq 0 ]] && ! stage_has LIS_ENV_BACKUP_RECIPIENTS && stage_obj_complete; then
@@ -476,6 +482,22 @@ restore_env_backup() {  # recover --env-from-backup: every setting and the key f
   else
     rm -f "$ident"
     die "couldn't restore from the encrypted backup (see above). Re-run without --env-from-backup to enter the settings by hand."
+  fi
+}
+
+enable_watchdog() {
+  log "Turning on Linode's Shutdown Watchdog for this host (it's booted again after a crash)"
+  im host-watchdog --enable || warn "couldn't turn on the Shutdown Watchdog (see above) -- turn it on in Cloud Manager: Settings, Shutdown Watchdog"
+}
+
+pre_upgrade_snapshot() {  # an upgrade (re-run on an existing install): a snapshot taken with the OLD code first
+  [[ -x "$PY" && -s "$INSTALL_DIR/state/instances.db" ]] || return 0
+  local dir; dir="$BACKUP_DIR/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+  log "Existing install found: taking a snapshot before upgrading ($dir)"
+  if im backup --backup-dir "$dir" >/dev/null 2>&1 || ls "$dir"/*.db >/dev/null 2>&1; then
+    PRE_UPGRADE_DIR="$dir"
+  else
+    warn "couldn't take the pre-upgrade snapshot -- the hourly backups still exist in $BACKUP_DIR"
   fi
 }
 
@@ -721,12 +743,14 @@ run_backup() {
 
 do_install() {
   install_packages
+  pre_upgrade_snapshot
   install_code
   configure_env
   check_token
   setup_ssh_key
   protect_ssh_key
   backup_env_encrypted
+  enable_watchdog
   build_dashboard
   write_units
   start_services
@@ -745,6 +769,11 @@ $(sed 's/^/    /' "$KEY_PATH.pub" 2>/dev/null)
   Logs:  the dashboard's Activity and Logs pages, $INSTALL_DIR/state/logs/, or journalctl -u $POLL_UNIT -f
 EOF
   obj_configured || warn "Object Storage isn't configured: only local snapshots in $BACKUP_DIR are kept, and they're lost with this host. Copy them off-host, or configure Object Storage and re-run install."
+  if [[ -n "${PRE_UPGRADE_DIR:-}" ]]; then
+    printf '\n  A snapshot from before this upgrade is in %s. To go back to the previous version:\n' "$PRE_UPGRADE_DIR"
+    printf '  check out the previous tag, re-run install.sh install, then\n'
+    printf '    sudo -u %s %s/.venv/bin/python %s/instance_manager.py restore --from-file %s/<file>.db --force\n' "$SERVICE_USER" "$INSTALL_DIR" "$INSTALL_DIR" "$PRE_UPGRADE_DIR"
+  fi
   if [[ -n "$NEW_PASSPHRASE" ]]; then
     printf '\n  Deployment SSH key passphrase (shown once; also in %s/.env as LIS_SSH_KEY_PASSPHRASE):\n\n      %s\n\n' "$INSTALL_DIR" "$NEW_PASSPHRASE"
     printf '  The key is stored encrypted with it in the database, every backup and Object Storage, and the\n'
@@ -800,6 +829,12 @@ EOF
   fetch_key_from_snapshot
   protect_ssh_key
   backup_env_encrypted
+  enable_watchdog
+  # The old host was confirmed gone above: this host becomes the active scheduler right away,
+  # instead of waiting for the old host's lease to expire.
+  if obj_configured; then
+    im scheduler-lease --take-over --yes || warn "couldn't take the scheduler lease -- it's taken automatically once the old one expires (3 minutes)"
+  fi
 
   log "Rebuilding from Linode tags and Object Storage (adds anything newer than the snapshot)"
   im rebuild --ssh-key "$KEY_PATH" || warn "rebuild reported names it couldn't fully recover (see above)"

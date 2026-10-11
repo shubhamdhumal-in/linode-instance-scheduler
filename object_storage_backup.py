@@ -245,6 +245,20 @@ def snapshot_database(db_path: Path, dest_path: Path) -> None:
 CONTINUOUS_SNAPSHOT_KEY = "full-backups/instances-continuous.db"
 
 
+def database_integrity_problem(path: Path) -> str | None:
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as e:
+        return str(e)
+    result = [r[0] for r in rows]
+    return None if result == ["ok"] else "; ".join(result[:3])
+
+
 def upload_database_snapshot(
     db_path: Path, *, attempts: int = DEFAULT_ATTEMPTS, delay_s: float = DEFAULT_DELAY_S,
     key: str | None = None,
@@ -258,6 +272,11 @@ def upload_database_snapshot(
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir) / "snapshot.db"
         snapshot_database(db_path, tmp_path)
+
+        problem = database_integrity_problem(tmp_path)
+        if problem:
+            raise ObjectStorageError(
+                f"refusing to upload a database snapshot that fails its integrity check: {problem}")
         body = tmp_path.read_bytes()
 
     md5_hex = hashlib.md5(body).hexdigest()
