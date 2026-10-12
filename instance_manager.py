@@ -1328,6 +1328,7 @@ def migrate_start_instance(
 
         if on_progress is not None:
             on_progress("Running pre-flight checks (cloud-init version, datasource, networking)...")
+        _move_stopped_owners_off(client, host, instance_id, name, on_progress, on_warning)
         _forget_unowned_host_key(host, on_progress)
         try:
             preflight = engine.check_path_b_preflight(host, ssh_key, password=ssh_password)
@@ -2724,6 +2725,9 @@ def onboard_instance(
                 on_progress("Capturing authorized_keys over SSH and data volumes over the API...")
 
 
+            _move_stopped_owners_off(
+                client, ssh_target, instance_id, name, on_progress, on_warning
+            )
             _forget_unowned_host_key(ssh_target, on_progress)
             authorized_keys_raw = engine.ssh_run(
                 ssh_target, ssh_key, "cat /root/.ssh/authorized_keys 2>/dev/null",
@@ -3113,6 +3117,75 @@ def _forget_unowned_host_key(address: str, on_progress: Callable[[str], None] | 
             f"  Forgot the SSH host key this tool held for {address}: no managed instance uses "
             "that address any more (an earlier instance had it)."
         )
+
+
+def _move_stopped_owners_off(
+    client, address: str, instance_id: int, name: str,
+    on_progress: Callable[[str], None] | None, on_warning: Callable[[str], None] | None,
+) -> None:
+
+    try:
+        live = engine.retry_transient(lambda: list(client.vpcs.ips()))
+    except Exception:
+        return
+    held = next(
+        (ip for ip in live if ip.address == address and ip.linode_id == instance_id), None
+    )
+    if held is None:
+        return
+    subnet_id = held.subnet_id
+    for other in _records_using_vpc_address(load_registry(), subnet_id, address, exclude=name):
+        try:
+            with _instance_lock(other):
+                registry = load_registry()
+                record = registry.get(other)
+                if record is None or other not in _records_using_vpc_address(
+                    registry, subnet_id, address
+                ):
+                    continue
+                if record.get("current_linode_id") or record.get("transitioning"):
+                    if on_warning is not None:
+                        on_warning(
+                            f"WARNING: managed node '{other}' is recorded with VPC address "
+                            f"{address}, which Linode has given to instance {instance_id}, and "
+                            f"'{other}' isn't stopped, so it wasn't moved. Move one of them with "
+                            "set-vpc-address before continuing."
+                        )
+                    continue
+                with _vpc_subnet_lock(subnet_id):
+                    registry = load_registry()
+                    record = registry[other]
+                    new_address = _free_vpc_address(
+                        registry, subnet_id, address, record.get("vpc_prefix"), live,
+                    )
+                    if new_address is None:
+                        if on_warning is not None:
+                            on_warning(
+                                f"WARNING: stopped node '{other}' is recorded with VPC address "
+                                f"{address}, now used by instance {instance_id}, and no free "
+                                "address was found to move it to. Free an address in the subnet "
+                                f"and run set-vpc-address --name {other}."
+                            )
+                        continue
+                    _move_vpc_address_locked(
+                        other, record, registry, subnet_id, address, new_address, on_warning,
+                    )
+                live.append(type("_Held", (), {"subnet_id": subnet_id, "address": new_address,
+                                               "linode_id": None})())
+                if on_progress is not None:
+                    on_progress(
+                        f"  Moved stopped node '{other}' from VPC address {address} to "
+                        f"{new_address}: Linode gave {address} to instance {instance_id} while "
+                        f"'{other}' was stopped. Anything that reaches '{other}' by its VPC "
+                        "address needs the new one."
+                    )
+        except InstanceLockedError:
+            if on_warning is not None:
+                on_warning(
+                    f"WARNING: stopped node '{other}' is recorded with VPC address {address} "
+                    f"(now used by instance {instance_id}) but is busy, so it wasn't moved. "
+                    "Try again in a minute, or move it with set-vpc-address."
+                )
 
 
 def _ssh_target(record: dict, name: str) -> str:

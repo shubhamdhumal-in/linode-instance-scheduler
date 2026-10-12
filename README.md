@@ -715,7 +715,11 @@ interface) is fully supported — onboard, stop, start, schedules, groups, hooks
   least likely to get) and started there, with nothing for anyone to run; the start's output and
   the poller's log say which address it moved from and to, so you can update anything that
   reaches it by address. Its trusted SSH host key moves with it, so the usual strict host-key
-  check still applies. To choose the new address yourself instead, move the stopped node first:
+  check still applies. The same move happens earlier when you migrate or onboard the new instance
+  that was given the address: before connecting to it, `migrate-start` and `onboard` move the
+  stopped node off that address (with its host key), so the new instance isn't checked against
+  the stopped node's key. A node that isn't stopped, or is busy, is left alone with a warning. To
+  choose the new address yourself instead, move the stopped node first:
 
   ```
   python instance_manager.py set-vpc-address --name db-1 --address 10.24.1.40

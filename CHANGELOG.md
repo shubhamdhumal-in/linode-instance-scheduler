@@ -4,6 +4,14 @@ All notable changes to this project. Versions follow [semantic versioning](https
 Upgrade by checking out the new tag and re-running `install.sh` (see `DEPLOYMENT.md`), or by
 moving to the new container image on Kubernetes (see `DEPLOYMENT-LKE.md`).
 
+## v1.12.1
+
+### Fixed
+- `migrate-start` and `onboard` no longer fail pre-flight with an SSH host-key mismatch when Linode
+  gave the new instance a VPC address a stopped managed node is recorded with. The stopped node is
+  moved to a free address in the same subnet first, with its trusted host key, as its own next
+  start would do; a node that isn't stopped, or is busy, is left alone with a warning.
+
 ## v1.12.0
 
 ### Added
