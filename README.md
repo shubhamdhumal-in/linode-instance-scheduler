@@ -739,10 +739,11 @@ interface) is fully supported — onboard, stop, start, schedules, groups, hooks
 - **VPC 1:1 NAT** (a public address mapped onto the VPC interface instead of a separate public
   interface) is supported under both networking models. The guest is set up exactly like a
   VPC-only node, and the scheduler reaches it over its VPC address. Linode releases an ordinary
-  NAT address when the instance is deleted, so unless the address is **reserved**, every start
-  gives the node a new public address (the start says which). Reserve it in Cloud Manager to
-  keep it: a reserved NAT address is reused on every start. Onboarding warns when it isn't
-  reserved. Under the older (legacy config) model the NAT address is the instance's own public
+  NAT address when the instance is deleted, so the tool **reserves** it, the same way it
+  reserves a public interface's address: when `migrate-resume` finishes, at onboarding, before
+  every stop, and after a `rollback`. A reserved NAT address is reused on every start. If
+  reserving fails, you get a warning and it is retried before the next stop; should a stop still
+  go ahead without it, the next start gets a new public address and says which. Under the older (legacy config) model the NAT address is the instance's own public
   IPv4, so only one NAT address per node is supported; a node mapping two is refused at
   onboarding.
 - **A reserved public IP that has since been assigned to another instance** (or released from

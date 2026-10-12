@@ -613,6 +613,41 @@ def nat_1_1_addresses(network_config: list[dict] | None, model: str | None) -> l
     return out
 
 
+def reserve_nat_1_1_addresses(
+    client: LinodeClient, network_config: list[dict] | None, model: str | None
+) -> tuple[list[str], list[tuple[str, str]]]:
+
+    reserved: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for address in dict.fromkeys(nat_1_1_addresses(network_config, model)):
+        try:
+            try:
+                retry_transient(lambda a=address: client.get(f"/networking/reserved/ips/{a}"))
+                continue
+            except ApiError as e:
+                if e.status != 404:
+                    raise
+            ip = retry_transient(lambda a=address: client.load(IPAddress, a))
+            if getattr(ip, "reserved", False):
+                continue
+            ip.reserved = True
+            retry_transient(ip.save)
+            reserved.append(address)
+        except (ApiError, requests.exceptions.RequestException) as e:
+            failed.append((address, str(e)))
+    return reserved, failed
+
+
+def reserve_instance_nat_1_1(client: LinodeClient, instance) -> tuple[list[str], list[tuple[str, str]]]:
+
+    try:
+        captured = capture_network_config(instance, configs=list(instance.configs))
+    except Exception as e:
+        return [], [("(network config)", str(e))]
+    return reserve_nat_1_1_addresses(
+        client, captured["network_config"], captured["network_interface_model"])
+
+
 def legacy_nat_only(network_config: list[dict] | None, model: str | None) -> bool:
 
     if model != INTERFACE_MODEL_LEGACY:
@@ -2846,8 +2881,19 @@ def resume_path_b_migration(
             if not ip.reserved:
                 ip.reserved = True
                 ip.save()
-        elif on_progress is not None:
-            on_progress("No public interface -- nothing to reserve (reached over its VPC/VLAN address).")
+
+
+        nat_reserved, nat_failed = reserve_instance_nat_1_1(client, client.load(Instance, instance.id))
+        if nat_failed and nat_failed[0][0] != "(network config)":
+            raise ConfigError(
+                "could not reserve the VPC 1:1 NAT public address "
+                + ", ".join(f"{a} ({err})" for a, err in nat_failed)
+                + " -- run migrate-resume again to retry.")
+        if on_progress is not None:
+            if nat_reserved:
+                on_progress(f"Reserved the VPC 1:1 NAT public address {', '.join(nat_reserved)}.")
+            elif not state.get("reserved_ip"):
+                on_progress("No public interface -- nothing to reserve (reached over its VPC/VLAN address).")
         _checkpoint("ip_reserved")
 
     return {
@@ -3828,6 +3874,15 @@ def restore_migration_backup(
             already_done=lambda: client.load(Instance, backup_id).status in ("booting", "running"))
         poll_until_status(lambda: client.load(Instance, backup_id), ("running",), timeout_s=900)
     final = client.load(Instance, backup_id)
+
+
+    nat_reserved, nat_failed = reserve_instance_nat_1_1(client, final)
+    if nat_reserved:
+        _say(f"Reserved the VPC 1:1 NAT public address {', '.join(nat_reserved)}.")
+    for address, err in nat_failed:
+        if on_warning is not None:
+            on_warning(f"WARNING: could not reserve the VPC 1:1 NAT address {address} ({err}); "
+                       "reserve it in Cloud Manager so it isn't released if the instance is deleted.")
     return {"original_deleted": original is not None, "label": label,
             "public_ipv4": [a for a in (final.ipv4 or []) if _is_public_ipv4(a)]}
 

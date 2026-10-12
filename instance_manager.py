@@ -2980,19 +2980,26 @@ def onboard_instance(
                 findings = []
             if findings:
                 on_warning(_neighbour_warning(name, findings))
-            unreserved_nat = [
-                a for a in engine.nat_1_1_addresses(record["network_config"], record["network_interface_model"])
-                if not _is_reserved_ip(client, a)
-            ]
-            if unreserved_nat:
-                on_warning(
-                    f"WARNING: '{name}' reaches the internet through VPC 1:1 NAT public address "
-                    f"{', '.join(unreserved_nat)}, which isn't reserved. Linode releases it when "
-                    "the instance is stopped, so it gets a new public address on every start. "
-                    "Reserve it in Cloud Manager to keep it."
-                )
+
+
+        _reserve_nat_or_warn(client, name, record, on_progress=on_progress, on_warning=on_warning)
 
         return OnboardResult(outcome="onboarded", record=record)
+
+
+def _reserve_nat_or_warn(client, name: str, record: dict, *, on_progress=None, on_warning=None) -> None:
+
+    reserved, failed = engine.reserve_nat_1_1_addresses(
+        client, record.get("network_config"), record.get("network_interface_model"))
+    if reserved and on_progress is not None:
+        on_progress(f"Reserved the VPC 1:1 NAT public address {', '.join(reserved)} for '{name}'.")
+    if failed and on_warning is not None:
+        on_warning(
+            f"WARNING: could not reserve the VPC 1:1 NAT public address "
+            f"{', '.join(f'{a} ({err})' for a, err in failed)} for '{name}'. Linode releases an "
+            "unreserved one when the instance is stopped, so it would get a new public address. "
+            "It is retried on every stop; or reserve it in Cloud Manager."
+        )
 
 
 def _is_reserved_ip(client, address: str) -> bool:
@@ -3709,13 +3716,24 @@ def _start_instance_locked(
 
         if on_progress is not None:
             on_progress(f"  instance: {instance.id}")
-        if lost_nat and on_warning is not None:
-            new_public = ", ".join(str(a) for a in (getattr(instance, "ipv4", None) or [])) or "a new address"
-            on_warning(
-                f"WARNING: '{name}''s VPC 1:1 NAT public address {', '.join(lost_nat)} wasn't "
-                f"reserved, so Linode released it when the instance was stopped; it now has "
-                f"{new_public}. Reserve the new address to keep it across stops and starts."
-            )
+        if lost_nat:
+
+            try:
+                new_reserved, _failed = engine.reserve_instance_nat_1_1(
+                    client, engine.retry_transient(lambda: client.load(Instance, instance.id)))
+            except Exception:
+                new_reserved = []
+            if on_warning is not None:
+                new_public = (", ".join(new_reserved)
+                              or ", ".join(str(a) for a in (getattr(instance, "ipv4", None) or []))
+                              or "a new address")
+                kept = (" It is now reserved, so it is kept from now on." if new_reserved
+                        else " It is reserved at the next stop.")
+                on_warning(
+                    f"WARNING: '{name}''s VPC 1:1 NAT public address {', '.join(lost_nat)} wasn't "
+                    f"reserved, so Linode released it when the instance was stopped; it now has "
+                    f"{new_public}.{kept}"
+                )
 
         try:
             engine.poll_until_status(
@@ -4288,6 +4306,9 @@ def _stop_instance_locked(
                             "policy is 'continue', so stopping anyway."
                         )
 
+        if fresh_network is not None:
+            _reserve_nat_or_warn(
+                client, name, {**record, **fresh_network}, on_progress=on_progress, on_warning=on_warning)
         if on_progress is not None:
             on_progress(f"Stopping '{name}' (confirmed detach before delete)...")
         try:

@@ -704,9 +704,9 @@ a week, rehearse at your real scale, then onboard production in waves.
       running at once, plus every OS/data volume and reserved IP, which exist permanently.
 - [ ] **Regional capacity** for your plans at your peak start time, for fleets of 100+.
 - [ ] **Instances with only VPC/VLAN interfaces**: the scheduler host must reach them over SSH
-      at their private address — run it inside the same VPC (or on the same VLAN). For VPC 1:1
-      NAT (either networking model), reserve the NAT address if its public address must stay the
-      same.
+      at their private address — run it inside the same VPC (or on the same VLAN). VPC 1:1 NAT
+      addresses (either networking model) are reserved automatically, so the public address stays
+      the same across stops and starts.
 
 ### 2. Deploy
 

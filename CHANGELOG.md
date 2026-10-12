@@ -4,6 +4,16 @@ All notable changes to this project. Versions follow [semantic versioning](https
 Upgrade by checking out the new tag and re-running `install.sh` (see `DEPLOYMENT.md`), or by
 moving to the new container image on Kubernetes (see `DEPLOYMENT-LKE.md`).
 
+## v1.12.3
+
+### Changed
+- A public address mapped through VPC 1:1 NAT is now reserved the same way a public interface's
+  address is: when `migrate-resume` finishes, at onboarding, before every stop, and after a
+  rollback. The node keeps the same public address across stops, starts and rollbacks. Nodes
+  onboarded with an earlier version have their NAT address reserved at their next stop. If
+  reserving fails you get a warning; onboarding and stops still go ahead, and `migrate-resume`
+  stops so you can run it again.
+
 ## v1.12.2
 
 ### Fixed
