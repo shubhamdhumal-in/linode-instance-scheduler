@@ -4,6 +4,14 @@ All notable changes to this project. Versions follow [semantic versioning](https
 Upgrade by checking out the new tag and re-running `install.sh` (see `DEPLOYMENT.md`), or by
 moving to the new container image on Kubernetes (see `DEPLOYMENT-LKE.md`).
 
+## v1.12.2
+
+### Fixed
+- Rolling back a pre-migration backup of an instance that gets its public address through VPC
+  1:1 NAT now reserves that address before the original instance is removed, so it is kept. If an
+  earlier attempt already lost it, the rollback finishes with a new 1:1 NAT address and says so,
+  instead of failing.
+
 ## v1.12.1
 
 ### Fixed

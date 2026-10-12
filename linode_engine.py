@@ -3717,6 +3717,9 @@ def restore_migration_backup(
         for i in orig.get("network_config") or []) or not orig.get("network_config")
     move = wanted[:1] if has_public_iface else []
 
+
+    nat_addresses = nat_1_1_addresses(orig.get("network_config"), model)
+
     backup = retry_transient(lambda: client.load(Instance, backup_id))
     if backup.status not in ("offline", "running"):
         poll_until_status(lambda: client.load(Instance, backup_id), ("offline", "running"),
@@ -3729,7 +3732,7 @@ def restore_migration_backup(
         poll_until_status(lambda: client.load(Instance, backup_id), ("offline",), timeout_s=900)
 
     if original is not None:
-        for address in move:
+        for address in dict.fromkeys(move + nat_addresses):
             _say(f"Reserving {address} so it is kept when the original instance is removed...")
             _reserve_address(client, address)
         _say(f"Removing the original instance {original.id} (its volumes are detached and kept; "
@@ -3740,6 +3743,18 @@ def restore_migration_backup(
         volumes = [retry_transient(lambda v=v: client.load(Volume, v)) for v in volume_ids]
         delete_instance_and_detach_volumes(client, original, volumes)
 
+
+    network_config, lost_nat = prepare_nat_1_1_for_recreate(
+        client, orig.get("network_config"), model)
+    for address in lost_nat:
+        if on_warning is not None:
+            on_warning(f"WARNING: public address {address} (VPC 1:1 NAT) was not reserved and "
+                       "was released with the original instance; the restored instance gets a "
+                       "new 1:1 NAT address. Update anything that reaches it by that address.")
+    if model == INTERFACE_MODEL_LEGACY:
+
+
+        move = move + [a for a in nat_1_1_addresses(network_config, model) if a not in move]
     for address in move:
         _say(f"Moving public address {address} to the backup...")
         if model == INTERFACE_MODEL_LEGACY:
@@ -3751,11 +3766,11 @@ def restore_migration_backup(
     if model == INTERFACE_MODEL_LEGACY:
         cfgs = retry_transient(lambda: client.get(f"/linode/instances/{backup_id}/configs"))
         cfg = (cfgs.get("data") or [])[0]
-        body = [_legacy_interface_body(i) for i in orig.get("network_config") or []]
+        body = [_legacy_interface_body(i) for i in network_config or []]
         retry_transient(lambda: client.put(
             f"/linode/instances/{backup_id}/configs/{cfg['id']}", data={"interfaces": body}))
     else:
-        for iface in orig.get("network_config") or []:
+        for iface in network_config or []:
             if iface.get("vpc") or iface.get("vlan"):
                 iface_body = _rebuild_linode_interface(iface)
                 iface_body.pop("public", None)
